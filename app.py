@@ -25,7 +25,7 @@ DB = "journal.db"
 def get_db():
     if USE_TURSO:
         # Conexión usando turso_serverless (HTTP)
-        conn = turso_serverless.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+        conn = turso_serverless.connect(TURSO_URL, auth_token=TURSO_TOKEN)
         try:
             yield conn
         finally:
