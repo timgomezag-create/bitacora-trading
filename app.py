@@ -113,7 +113,28 @@ def init_db():
         except Exception:
             pass  # La columna ya existe
 
-init_db()
+# --- INICIALIZACIÓN SEGURA ---
+_db_initialized = False
+
+def ensure_db():
+    global _db_initialized
+    if _db_initialized:
+        return
+    try:
+        init_db()
+        _db_initialized = True
+    except Exception as e:
+        print(f"⚠️ Error al inicializar la DB (se reintentará luego): {e}")
+
+# Intentar inicializar al arrancar, pero SIN bloquear si falla
+try:
+    ensure_db()
+except Exception:
+    pass
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "db_initialized": _db_initialized}
 
 # ---------- Utilidades de Autenticación ----------
 def hash_pw(pw):
@@ -161,6 +182,7 @@ class CapitalIn(BaseModel):
 # ---------- Rutas de Autenticación ----------
 @app.post("/api/register")
 def register(data: AuthIn):
+    ensure_db() # <-- Asegurar DB
     if len(data.username) < 3 or len(data.password) < 6:
         raise HTTPException(400, "Usuario mínimo 3 y contraseña mínimo 6")
     try:
@@ -177,6 +199,7 @@ def register(data: AuthIn):
 
 @app.post("/api/login")
 def login(data: AuthIn):
+    ensure_db() # <-- Asegurar DB
     rows = db_execute("SELECT * FROM users WHERE username=?", (data.username,), fetch=True)
     if not rows or not check_pw(data.password, rows[0]["password_hash"]):
         raise HTTPException(401, "Credenciales incorrectas")
@@ -186,11 +209,13 @@ def login(data: AuthIn):
 
 @app.get("/api/me")
 def me(authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     return db_execute("SELECT id, username, share_token, is_public, initial_capital FROM users WHERE id=?", (uid,), fetch=True)[0]
 
 @app.put("/api/settings")
 def update_settings(data: CapitalIn, authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     db_execute("UPDATE users SET initial_capital=? WHERE id=?", (data.amount, uid))
     return {"ok": True}
@@ -198,6 +223,7 @@ def update_settings(data: CapitalIn, authorization: str = Header(None)):
 # ---------- Rutas de Operaciones ----------
 @app.get("/api/trades")
 def list_trades(authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     return db_execute("""
         SELECT id, user_id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes,
@@ -207,6 +233,7 @@ def list_trades(authorization: str = Header(None)):
 
 @app.get("/api/trades/{trade_id}/image")
 def get_trade_image(trade_id: int, authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     rows = db_execute("SELECT chart_image FROM trades WHERE id=? AND user_id=?", (trade_id, uid), fetch=True)
     if not rows or not rows[0]["chart_image"]:
@@ -215,6 +242,7 @@ def get_trade_image(trade_id: int, authorization: str = Header(None)):
 
 @app.post("/api/trades")
 def create_trade(t: TradeIn, authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     db_execute("""
         INSERT INTO trades(user_id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes, chart_image)
@@ -224,6 +252,7 @@ def create_trade(t: TradeIn, authorization: str = Header(None)):
 
 @app.put("/api/trades/{trade_id}")
 def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     db_execute("""
         UPDATE trades SET symbol=?, side=?, session=?, setup=?, result=?, pips=?, lot_size=?, pip_value=?, risk_pips=?, notes=?, chart_image=COALESCE(?, chart_image)
@@ -233,6 +262,7 @@ def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
 
 @app.delete("/api/trades/{trade_id}")
 def delete_trade(trade_id: int, authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     db_execute("DELETE FROM trades WHERE id=? AND user_id=?", (trade_id, uid))
     return {"ok": True}
@@ -240,6 +270,7 @@ def delete_trade(trade_id: int, authorization: str = Header(None)):
 # ---------- Rutas para Compartir ----------
 @app.post("/api/share")
 def toggle_share(data: ShareIn, authorization: str = Header(None)):
+    ensure_db() # <-- Asegurar DB
     uid = current_user(authorization)
     db_execute("UPDATE users SET is_public=? WHERE id=?", (1 if data.enabled else 0, uid))
     rows = db_execute("SELECT share_token FROM users WHERE id=?", (uid,), fetch=True)
@@ -247,6 +278,7 @@ def toggle_share(data: ShareIn, authorization: str = Header(None)):
 
 @app.get("/api/public/{share_token}")
 def public_view(share_token: str):
+    ensure_db() # <-- Asegurar DB
     users = db_execute("SELECT id, username, is_public, initial_capital FROM users WHERE share_token=?", (share_token,), fetch=True)
     if not users or not users[0]["is_public"]:
         raise HTTPException(404, "Bitácora no disponible")
