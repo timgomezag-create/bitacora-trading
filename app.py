@@ -1,31 +1,35 @@
-import sqlite3, hashlib, secrets, os
+import os
+import sqlite3
+import hashlib
+import secrets
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import libsql_client
 
-app = FastAPI(title="Bitácora de Trading")
+app = FastAPI(title="Bitácora de Trading Pro")
 
 # ---------- Configuración de Base de Datos ----------
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
-DB = "journal.db"
+DB_LOCAL = "journal.db"
 
 @contextmanager
 def get_db():
     if USE_TURSO:
-        # libsql-client acepta libsql:// y lo normaliza a https internamente
-        client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_TOKEN)
+        # Normalizar la URL de Turso para libsql_client
+        url = TURSO_URL.replace("libsql://", "https://") if TURSO_URL.startswith("libsql://") else TURSO_URL
+        client = libsql_client.create_client_sync(url=url, auth_token=TURSO_TOKEN)
         try:
             yield client
         finally:
             client.close()
     else:
-        conn = sqlite3.connect(DB)
+        conn = sqlite3.connect(DB_LOCAL)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -37,41 +41,81 @@ def db_execute(query, params=(), fetch=False):
     with get_db() as c:
         if USE_TURSO:
             res = c.execute(query, list(params))
-            if fetch: return [dict(row) for row in res.rows]
+            if fetch:
+                return [dict(row) for row in res.rows]
             return res
         else:
             cur = c.execute(query, params)
-            if fetch: return [dict(row) for row in cur.fetchall()]
+            if fetch:
+                return [dict(row) for row in cur.fetchall()]
             return cur
 
 def init_db():
     with get_db() as c:
         if USE_TURSO:
-            c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)")
-            c.execute("CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)")
-            c.execute("""CREATE TABLE IF NOT EXISTS trades(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
-                entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
-                stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
-                chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+            statements = [
+                "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)",
+                "CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)",
+                """CREATE TABLE IF NOT EXISTS trades(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    user_id INTEGER NOT NULL, 
+                    symbol TEXT NOT NULL, 
+                    side TEXT NOT NULL,
+                    session TEXT,
+                    setup TEXT,
+                    result TEXT,
+                    pips REAL,
+                    lot_size REAL,
+                    pip_value REAL DEFAULT 10,
+                    risk_pips REAL,
+                    notes TEXT,
+                    chart_image TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )"""
+            ]
+            for stmt in statements:
+                c.execute(stmt)
         else:
             c.executescript("""
             CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000);
             CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS trades(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
-                entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
-                stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
-                chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                session TEXT,
+                setup TEXT,
+                result TEXT,
+                pips REAL,
+                lot_size REAL,
+                pip_value REAL DEFAULT 10,
+                risk_pips REAL,
+                notes TEXT,
+                chart_image TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             """)
-    # Añadir columnas si la tabla ya existe (para migraciones)
-    try: db_execute("ALTER TABLE trades ADD COLUMN chart_image TEXT")
-    except Exception: pass
-    try: db_execute("ALTER TABLE users ADD COLUMN initial_capital REAL DEFAULT 10000")
-    except Exception: pass
+    
+    # Migraciones seguras para añadir columnas nuevas a tablas existentes
+    nuevas_columnas = [
+        ("session", "TEXT"),
+        ("setup", "TEXT"),
+        ("result", "TEXT"),
+        ("pips", "REAL"),
+        ("lot_size", "REAL"),
+        ("pip_value", "REAL DEFAULT 10"),
+        ("risk_pips", "REAL")
+    ]
+    for col, tipo in nuevas_columnas:
+        try:
+            db_execute(f"ALTER TABLE trades ADD COLUMN {col} {tipo}")
+        except Exception:
+            pass  # La columna ya existe
 
 init_db()
 
+# ---------- Utilidades de Autenticación ----------
 def hash_pw(pw):
     salt = secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000).hex()
@@ -86,10 +130,11 @@ def current_user(authorization: str = Header(None)):
         raise HTTPException(401, "No autenticado")
     token = authorization[7:]
     rows = db_execute("SELECT user_id FROM tokens WHERE token=?", (token,), fetch=True)
-    if not rows: raise HTTPException(401, "Token inválido")
+    if not rows:
+        raise HTTPException(401, "Token inválido")
     return rows[0]["user_id"]
 
-# ---------- Modelos ----------
+# ---------- Modelos de Datos ----------
 class AuthIn(BaseModel):
     username: str
     password: str
@@ -97,15 +142,13 @@ class AuthIn(BaseModel):
 class TradeIn(BaseModel):
     symbol: str
     side: str
-    entry_date: Optional[str] = None
-    exit_date: Optional[str] = None
-    entry_price: Optional[float] = None
-    exit_price: Optional[float] = None
-    quantity: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    fees: Optional[float] = 0
-    strategy: Optional[str] = None
+    session: Optional[str] = None
+    setup: Optional[str] = None
+    result: Optional[str] = None
+    pips: Optional[float] = None
+    lot_size: Optional[float] = None
+    pip_value: Optional[float] = 10
+    risk_pips: Optional[float] = None
     notes: Optional[str] = None
     chart_image: Optional[str] = None
 
@@ -115,24 +158,28 @@ class ShareIn(BaseModel):
 class CapitalIn(BaseModel):
     amount: float
 
-# ---------- Rutas Auth ----------
+# ---------- Rutas de Autenticación ----------
 @app.post("/api/register")
 def register(data: AuthIn):
-    if len(data.username) < 3 or len(data.password) < 6: raise HTTPException(400, "Usuario mínimo 3 y contraseña mínimo 6")
+    if len(data.username) < 3 or len(data.password) < 6:
+        raise HTTPException(400, "Usuario mínimo 3 y contraseña mínimo 6")
     try:
-        db_execute("INSERT INTO users(username, password_hash, share_token) VALUES(?,?,?)", (data.username, hash_pw(data.password), secrets.token_urlsafe(16)))
+        db_execute("INSERT INTO users(username, password_hash, share_token) VALUES(?,?,?)",
+                   (data.username, hash_pw(data.password), secrets.token_urlsafe(16)))
         user = db_execute("SELECT id FROM users WHERE username=?", (data.username,), fetch=True)[0]
         token = secrets.token_urlsafe(32)
         db_execute("INSERT INTO tokens(token, user_id) VALUES(?,?)", (token, user["id"]))
         return {"token": token, "username": data.username}
     except Exception as e:
-        if "UNIQUE" in str(e): raise HTTPException(400, "El usuario ya existe")
+        if "UNIQUE" in str(e):
+            raise HTTPException(400, "El usuario ya existe")
         raise HTTPException(500, str(e))
 
 @app.post("/api/login")
 def login(data: AuthIn):
     rows = db_execute("SELECT * FROM users WHERE username=?", (data.username,), fetch=True)
-    if not rows or not check_pw(data.password, rows[0]["password_hash"]): raise HTTPException(401, "Credenciales incorrectas")
+    if not rows or not check_pw(data.password, rows[0]["password_hash"]):
+        raise HTTPException(401, "Credenciales incorrectas")
     token = secrets.token_urlsafe(32)
     db_execute("INSERT INTO tokens(token, user_id) VALUES(?,?)", (token, rows[0]["id"]))
     return {"token": token, "username": rows[0]["username"]}
@@ -148,33 +195,40 @@ def update_settings(data: CapitalIn, authorization: str = Header(None)):
     db_execute("UPDATE users SET initial_capital=? WHERE id=?", (data.amount, uid))
     return {"ok": True}
 
-# ---------- Rutas Trades ----------
+# ---------- Rutas de Operaciones ----------
 @app.get("/api/trades")
 def list_trades(authorization: str = Header(None)):
     uid = current_user(authorization)
-    return db_execute("SELECT id, user_id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, (chart_image IS NOT NULL) as has_image FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (uid,), fetch=True)
+    return db_execute("""
+        SELECT id, user_id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes,
+               (chart_image IS NOT NULL) as has_image, created_at
+        FROM trades WHERE user_id=? ORDER BY created_at DESC
+    """, (uid,), fetch=True)
 
 @app.get("/api/trades/{trade_id}/image")
 def get_trade_image(trade_id: int, authorization: str = Header(None)):
     uid = current_user(authorization)
     rows = db_execute("SELECT chart_image FROM trades WHERE id=? AND user_id=?", (trade_id, uid), fetch=True)
-    if not rows or not rows[0]["chart_image"]: raise HTTPException(404, "Sin imagen")
+    if not rows or not rows[0]["chart_image"]:
+        raise HTTPException(404, "Sin imagen")
     return {"image": rows[0]["chart_image"]}
 
 @app.post("/api/trades")
 def create_trade(t: TradeIn, authorization: str = Header(None)):
     uid = current_user(authorization)
-    db_execute("""INSERT INTO trades(user_id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, chart_image)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (uid, t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price, t.quantity, t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes, t.chart_image))
+    db_execute("""
+        INSERT INTO trades(user_id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes, chart_image)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (uid, t.symbol, t.side, t.session, t.setup, t.result, t.pips, t.lot_size, t.pip_value, t.risk_pips, t.notes, t.chart_image))
     return {"ok": True}
 
 @app.put("/api/trades/{trade_id}")
 def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
     uid = current_user(authorization)
-    db_execute("""UPDATE trades SET symbol=?, side=?, entry_date=?, exit_date=?, entry_price=?, exit_price=?, quantity=?, stop_loss=?, take_profit=?, fees=?, strategy=?, notes=?, chart_image=COALESCE(?, chart_image)
-        WHERE id=? AND user_id=?""",
-        (t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price, t.quantity, t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes, t.chart_image, trade_id, uid))
+    db_execute("""
+        UPDATE trades SET symbol=?, side=?, session=?, setup=?, result=?, pips=?, lot_size=?, pip_value=?, risk_pips=?, notes=?, chart_image=COALESCE(?, chart_image)
+        WHERE id=? AND user_id=?
+    """, (t.symbol, t.side, t.session, t.setup, t.result, t.pips, t.lot_size, t.pip_value, t.risk_pips, t.notes, t.chart_image, trade_id, uid))
     return {"ok": True}
 
 @app.delete("/api/trades/{trade_id}")
@@ -183,7 +237,7 @@ def delete_trade(trade_id: int, authorization: str = Header(None)):
     db_execute("DELETE FROM trades WHERE id=? AND user_id=?", (trade_id, uid))
     return {"ok": True}
 
-# ---------- Rutas Compartir ----------
+# ---------- Rutas para Compartir ----------
 @app.post("/api/share")
 def toggle_share(data: ShareIn, authorization: str = Header(None)):
     uid = current_user(authorization)
@@ -194,27 +248,32 @@ def toggle_share(data: ShareIn, authorization: str = Header(None)):
 @app.get("/api/public/{share_token}")
 def public_view(share_token: str):
     users = db_execute("SELECT id, username, is_public, initial_capital FROM users WHERE share_token=?", (share_token,), fetch=True)
-    if not users or not users[0]["is_public"]: raise HTTPException(404, "Bitácora no disponible")
-    trades = db_execute("SELECT id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, (chart_image IS NOT NULL) as has_image FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (users[0]["id"],), fetch=True)
+    if not users or not users[0]["is_public"]:
+        raise HTTPException(404, "Bitácora no disponible")
+    trades = db_execute("""
+        SELECT id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes,
+               (chart_image IS NOT NULL) as has_image, created_at
+        FROM trades WHERE user_id=? ORDER BY created_at DESC
+    """, (users[0]["id"],), fetch=True)
     return {"username": users[0]["username"], "trades": trades, "initial_capital": users[0]["initial_capital"]}
 
-# ---------- Frontend (El mismo de antes) ----------
+# ---------- Frontend ----------
 HTML = r"""
 <!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bitácora de Trading</title>
+<title>Bitácora de Trading Pro</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   :root{--bg:#0f1720;--card:#17212b;--line:#243140;--txt:#e6edf3;--mut:#8aa0b4;--acc:#3fb950;--neg:#f85149;--blue:#58a6ff}
   *{box-sizing:border-box} body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
   header{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;border-bottom:1px solid var(--line);background:#0b1219}
   h1{font-size:18px;margin:0} .mut{color:var(--mut);font-size:13px}
-  .container{max-width:1200px;margin:0 auto;padding:22px}
+  .container{max-width:1250px;margin:0 auto;padding:22px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
   .metric{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
   .metric .v{font-size:20px;font-weight:600;margin-top:4px}
   .metric .l{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
@@ -237,11 +296,12 @@ HTML = r"""
   a{color:var(--blue)}
   .banner{background:#1f2a12;border:1px solid #3fb95033;color:var(--acc);padding:8px 12px;border-radius:8px;font-size:13px}
   .img-preview{max-width:100%;max-height:200px;border-radius:8px;margin-top:8px;object-fit:contain;background:#0b1219}
+  .edge-card{background:#0d151d;border:1px solid var(--line);border-radius:8px;padding:12px}
 </style>
 </head>
 <body>
 <header>
-  <div class="row"><strong>📓 Bitácora de Trading</strong><span id="userLabel" class="mut"></span></div>
+  <div class="row"><strong>📓 Bitácora Pro</strong><span id="userLabel" class="mut"></span></div>
   <div class="row" id="topActions">
     <button class="ghost hidden" id="configBtn" onclick="openConfig()">⚙️ Config</button>
     <button class="ghost hidden" id="shareBtn" onclick="toggleShare()">Compartir</button>
@@ -265,10 +325,23 @@ HTML = r"""
 
 <div class="container hidden" id="appView">
   <div id="publicBanner" class="banner hidden"></div>
+  
   <div class="grid" id="metricsGrid"></div>
+  
+  <!-- Dashboard de Edge -->
+  <div class="card">
+    <strong>📊 Dashboard de Edge (Mejor rendimiento)</strong>
+    <div class="grid" style="margin-top:12px" id="edgeGrid">
+        <div class="edge-card"><div class="l">Mejor Activo</div><div class="v" id="bestAsset">—</div></div>
+        <div class="edge-card"><div class="l">Mejor Sesión</div><div class="v" id="bestSession">—</div></div>
+        <div class="edge-card"><div class="l">Mejor Setup</div><div class="v" id="bestSetup">—</div></div>
+        <div class="edge-card"><div class="l">Mejor Día</div><div class="v" id="bestDay">—</div></div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
-      <strong>Curva de capital</strong>
+      <strong>Curva de Capital</strong>
       <div class="row">
         <label style="margin:0">Desde: <input type="date" id="filterFrom" onchange="renderAll()" style="width:auto;padding:4px"></label>
         <label style="margin:0">Hasta: <input type="date" id="filterTo" onchange="renderAll()" style="width:auto;padding:4px"></label>
@@ -276,11 +349,12 @@ HTML = r"""
     </div>
     <canvas id="equityChart" height="90"></canvas>
   </div>
+
   <div class="card">
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
       <strong>Operaciones</strong>
       <div class="row">
-        <select id="filterStrategy" onchange="renderAll()" style="width:140px"></select>
+        <select id="filterSession" onchange="renderAll()" style="width:130px"></select>
         <select id="filterSymbol" onchange="renderAll()" style="width:120px"></select>
         <button id="addBtn" onclick="openForm()">+ Nueva operación</button>
       </div>
@@ -289,42 +363,68 @@ HTML = r"""
   </div>
 </div>
 
+<!-- Modal de Formulario -->
 <div class="modal" id="modal">
   <div class="card">
     <div class="row" style="justify-content:space-between"><strong id="formTitle">Nueva operación</strong>
       <button class="ghost" onclick="closeForm()">✕</button></div>
     <input type="hidden" id="tradeId">
+    
     <div class="two" style="margin-top:12px">
-      <div><label>Símbolo</label><input id="symbol" placeholder="AAPL"></div>
+      <div><label>Fecha y Hora</label><input id="created_at" type="datetime-local"></div>
+      <div><label>Activo</label><input id="symbol" placeholder="EURUSD, XAUUSD..."></div>
+      
       <div><label>Dirección</label><select id="side"><option value="long">Long</option><option value="short">Short</option></select></div>
-      <div><label>Fecha entrada</label><input id="entry_date" type="date"></div>
-      <div><label>Fecha salida</label><input id="exit_date" type="date"></div>
-      <div><label>Precio entrada</label><input id="entry_price" type="text" placeholder="Ej: 1,11916"></div>
-      <div><label>Precio salida</label><input id="exit_price" type="text" placeholder="Ej: 1,11955"></div>
-      <div><label>Cantidad</label><input id="quantity" type="text" placeholder="Ej: 1"></div>
-      <div><label>Stop loss</label><input id="stop_loss" type="text" placeholder="Ej: 1,11937"></div>
-      <div><label>Take profit</label><input id="take_profit" type="text" placeholder="Ej: 1,11955"></div>
-      <div><label>Comisiones</label><input id="fees" type="text" value="0"></div>
-      <div><label>Estrategia</label><input id="strategy" placeholder="Breakout..."></div>
-      <div><label>Notas</label><input id="notes" placeholder="Observaciones"></div>
+      <div><label>Sesión</label><select id="session">
+        <option value="Asia">Asia</option>
+        <option value="Londres">Londres</option>
+        <option value="NY">NY</option>
+      </select></div>
+      
+      <div><label>Setup</label><select id="setup">
+        <option value="1">Setup 1</option>
+        <option value="2">Setup 2</option>
+        <option value="3">Setup 3</option>
+        <option value="4">Setup 4</option>
+      </select></div>
+      <div><label>Resultado</label><select id="result">
+        <option value="TP Full">TP Full</option>
+        <option value="TP Parcial">TP Parcial</option>
+        <option value="BE">BE</option>
+        <option value="SL">SL</option>
+      </select></div>
+      
+      <div><label>Pips Ganados/Perdidos</label><input id="pips" type="text" placeholder="Ej: +50 o -20"></div>
+      <div><label>Lotaje</label><input id="lot_size" type="text" placeholder="Ej: 0.5"></div>
+      
+      <div><label>Valor del Pip</label><input id="pip_value" type="text" value="10"></div>
+      <div><label>Pips de Riesgo (Stop Loss)</label><input id="risk_pips" type="text" placeholder="Ej: 20"></div>
     </div>
+
+    <div style="margin-top:12px">
+        <label>Notas</label>
+        <textarea id="notes" rows="2" placeholder="Observaciones de la operación..."></textarea>
+    </div>
+
     <div style="margin-top:12px">
       <label>Captura de TradingView (Opcional)</label>
       <input type="file" id="chart_image_input" accept="image/*" onchange="handleImageUpload(event)" style="background:transparent;border:none;padding-left:0">
       <img id="image_preview" class="img-preview hidden" src="">
     </div>
+
     <div class="row" style="margin-top:16px;justify-content:flex-end">
       <button class="ghost" onclick="closeForm()">Cancelar</button>
-      <button onclick="saveTrade()">Guardar</button>
+      <button onclick="saveTrade()">Guardar Operación</button>
     </div>
   </div>
 </div>
 
+<!-- Modal de Configuración -->
 <div class="modal" id="configModal">
   <div class="card" style="max-width:400px">
     <div class="row" style="justify-content:space-between"><strong>⚙️ Configuración</strong>
       <button class="ghost" onclick="closeConfig()">✕</button></div>
-    <p class="mut" style="margin-top:12px">Configurá tu capital inicial para que las métricas y la curva se ajusten a tu cuenta real.</p>
+    <p class="mut" style="margin-top:12px">Capital inicial para calcular métricas y curva de capital.</p>
     <label>Capital Inicial (USD)</label>
     <input type="text" id="initialCapitalInput" placeholder="Ej: 10000">
     <div class="row" style="margin-top:16px;justify-content:flex-end">
@@ -433,32 +533,26 @@ async function saveConfig() {
   closeConfig(); renderAll();
 }
 
+function calcPnL(t) {
+    if (t.pips == null || t.lot_size == null) return null;
+    const pipVal = t.pip_value || 10;
+    const dir = t.side === 'long' ? 1 : -1;
+    return t.pips * pipVal * t.lot_size * dir;
+}
+
 function computeMetrics(trades) {
   const initialCap = state.user?.initial_capital || 10000;
-  const closed = trades.filter(t => t.exit_price != null && t.exit_date && t.entry_price != null && t.quantity != null);
+  const closed = trades.filter(t => t.pips != null && t.lot_size != null);
+  
   const rows = closed.map(t => {
-    const dir = t.side === 'long' ? 1 : -1;
-    const pnl = (t.exit_price - t.entry_price) * t.quantity * dir - (t.fees || 0);
-    const risk = t.stop_loss ? Math.abs(t.entry_price - t.stop_loss) * t.quantity : null;
-    let durationDays = 0;
-    if (t.entry_date && t.exit_date) durationDays = (new Date(t.exit_date) - new Date(t.entry_date)) / (1000 * 60 * 60 * 24);
-    return {...t, pnl, r: risk ? pnl / risk : null, durationDays};
-  }).sort((a, b) => new Date(a.exit_date) - new Date(b.exit_date));
+    const pnl = calcPnL(t);
+    const risk = t.risk_pips ? t.risk_pips * (t.pip_value || 10) * t.lot_size : null;
+    return {...t, pnl, r: (risk && pnl != null) ? pnl / risk : null};
+  }).sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
 
   const wins = rows.filter(r => r.pnl > 0), losses = rows.filter(r => r.pnl < 0);
   const grossProfit = wins.reduce((s, r) => s + r.pnl, 0), grossLoss = Math.abs(losses.reduce((s, r) => s + r.pnl, 0));
   const netPnl = rows.reduce((s, r) => s + r.pnl, 0);
-
-  let maxWinStreak = 0, maxLossStreak = 0, currentStreak = 0;
-  rows.forEach(r => {
-    if (r.pnl > 0) { currentStreak = currentStreak > 0 ? currentStreak + 1 : 1; maxWinStreak = Math.max(maxWinStreak, currentStreak); }
-    else if (r.pnl < 0) { currentStreak = currentStreak < 0 ? currentStreak - 1 : -1; maxLossStreak = Math.max(maxLossStreak, Math.abs(currentStreak)); }
-  });
-
-  const longs = rows.filter(r => r.side === 'long'), shorts = rows.filter(r => r.side === 'short');
-  const winRateLong = longs.length ? (longs.filter(r => r.pnl > 0).length / longs.length) * 100 : 0;
-  const winRateShort = shorts.length ? (shorts.filter(r => r.pnl > 0).length / shorts.length) * 100 : 0;
-  const avgDuration = rows.length ? rows.reduce((s, r) => s + r.durationDays, 0) / rows.length : 0;
 
   let currentCapital = initialCap, peak = initialCap, maxDD = 0;
   const curve = [{date: 'Inicio', value: initialCap}];
@@ -466,25 +560,55 @@ function computeMetrics(trades) {
     currentCapital += r.pnl; 
     peak = Math.max(peak, currentCapital); 
     maxDD = Math.max(maxDD, peak - currentCapital); 
-    curve.push({date: r.exit_date, value: currentCapital}); 
+    curve.push({date: new Date(r.created_at).toLocaleDateString(), value: currentCapital}); 
   });
   
   const maxDDpct = peak > 0 ? (maxDD / peak) * 100 : 0;
   const roi = ((currentCapital - initialCap) / initialCap) * 100;
   const rs = rows.filter(r => r.r != null).map(r => r.r);
 
+  // --- Cálculos de Edge ---
+  const groupBy = (arr, key) => arr.reduce((acc, obj) => {
+      const k = obj[key] || 'N/A';
+      if (!acc[k]) acc[k] = {pnl: 0, count: 0, wins: 0};
+      acc[k].pnl += obj.pnl; acc[k].count++; if(obj.pnl > 0) acc[k].wins++;
+      return acc;
+  }, {});
+  
+  const findBest = (grouped) => {
+      let best = {name: '—', pnl: -Infinity};
+      for (const [name, data] of Object.entries(grouped)) {
+          if (data.pnl > best.pnl) best = {name, pnl: data.pnl};
+      }
+      return best;
+  };
+
+  const daysOfWeek = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  rows.forEach(r => {
+      if (r.created_at) {
+          const d = new Date(r.created_at).getDay();
+          r.dayName = daysOfWeek[d];
+      }
+  });
+
+  const bestAsset = findBest(groupBy(rows, 'symbol'));
+  const bestSession = findBest(groupBy(rows, 'session'));
+  const bestSetup = findBest(groupBy(rows, 'setup'));
+  const bestDay = findBest(groupBy(rows, 'dayName'));
+
   return {
     count: rows.length, winRate: rows.length ? (wins.length / rows.length) * 100 : 0,
     profitFactor: grossLoss ? grossProfit / grossLoss : (grossProfit ? Infinity : 0),
     netPnl, expectancy: rows.length ? netPnl / rows.length : 0,
     avgWin: wins.length ? grossProfit / wins.length : 0, avgLoss: losses.length ? -grossLoss / losses.length : 0,
-    maxDD, maxDDpct, roi, avgR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null, curve, rows, maxWinStreak, maxLossStreak, winRateLong, winRateShort, avgDuration
+    maxDD, maxDDpct, roi, avgR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null, curve, rows,
+    bestAsset, bestSession, bestSetup, bestDay
   };
 }
 
 function fmt(n, d = 2) { return n == null || isNaN(n) ? '—' : n.toLocaleString('es-AR', {minimumFractionDigits: d, maximumFractionDigits: d}); }
 function pct(n) { return n == null || isNaN(n) ? '—' : n.toFixed(2) + '%'; }
-function money(n) { return (n >= 0 ? '+' : '') + fmt(n); }
+function money(n) { return n == null ? '—' : (n >= 0 ? '+' : '') + fmt(n); }
 
 function renderMetrics(m) {
   const cards = [
@@ -495,15 +619,16 @@ function renderMetrics(m) {
     ['ROI', pct(m.roi), m.roi >= 0 ? 'pos' : 'neg'],
     ['Expectancy', money(m.expectancy), m.expectancy >= 0 ? 'pos' : 'neg'],
     ['Avg R', m.avgR == null ? '—' : fmt(m.avgR), m.avgR >= 0 ? 'pos' : 'neg'],
-    ['Max Drawdown', fmt(m.maxDD) + ' (' + pct(m.maxDDpct) + ')', 'neg'],
-    ['Avg Win / Loss', money(m.avgWin) + ' / ' + money(m.avgLoss), ''],
-    ['Racha Max Wins', m.maxWinStreak, 'pos'],
-    ['Racha Max Losses', m.maxLossStreak, 'neg'],
-    ['Win Rate Long', pct(m.winRateLong), ''],
-    ['Win Rate Short', pct(m.winRateShort), ''],
-    ['Duración Media', fmt(m.avgDuration, 1) + ' días', '']
+    ['Max Drawdown', fmt(m.maxDD) + ' (' + pct(m.maxDDpct) + ')', 'neg']
   ];
   $('metricsGrid').innerHTML = cards.map(c => `<div class="metric"><div class="l">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
+}
+
+function renderEdge(m) {
+    $('bestAsset').innerHTML = m.bestAsset.name !== '—' ? `${m.bestAsset.name} <span class="${m.bestAsset.pnl >= 0 ? 'pos' : 'neg'}">(${money(m.bestAsset.pnl)})</span>` : '—';
+    $('bestSession').innerHTML = m.bestSession.name !== '—' ? `${m.bestSession.name} <span class="${m.bestSession.pnl >= 0 ? 'pos' : 'neg'}">(${money(m.bestSession.pnl)})</span>` : '—';
+    $('bestSetup').innerHTML = m.bestSetup.name !== '—' ? `${m.bestSetup.name} <span class="${m.bestSetup.pnl >= 0 ? 'pos' : 'neg'}">(${money(m.bestSetup.pnl)})</span>` : '—';
+    $('bestDay').innerHTML = m.bestDay.name !== '—' ? `${m.bestDay.name} <span class="${m.bestDay.pnl >= 0 ? 'pos' : 'neg'}">(${money(m.bestDay.pnl)})</span>` : '—';
 }
 
 function renderChart(curve) {
@@ -515,21 +640,21 @@ function renderChart(curve) {
 }
 
 function renderFilters() {
-  const strategies = [...new Set(state.trades.map(t => t.strategy).filter(Boolean))].sort();
+  const sessions = [...new Set(state.trades.map(t => t.session).filter(Boolean))].sort();
   const symbols = [...new Set(state.trades.map(t => t.symbol).filter(Boolean))].sort();
-  const fs = $('filterStrategy'), fsn = $('filterSymbol'), curS = fs.value, curSym = fsn.value;
-  fs.innerHTML = '<option value="">Todas las estrategias</option>' + strategies.map(s => `<option value="${s}">${s}</option>`).join('');
-  fsn.innerHTML = '<option value="">Todos los símbolos</option>' + symbols.map(s => `<option value="${s}">${s}</option>`).join('');
-  if (strategies.includes(curS)) fs.value = curS;
+  const fs = $('filterSession'), fsn = $('filterSymbol'), curS = fs.value, curSym = fsn.value;
+  fs.innerHTML = '<option value="">Todas las sesiones</option>' + sessions.map(s => `<option value="${s}">${s}</option>`).join('');
+  fsn.innerHTML = '<option value="">Todos los activos</option>' + symbols.map(s => `<option value="${s}">${s}</option>`).join('');
+  if (sessions.includes(curS)) fs.value = curS;
   if (symbols.includes(curSym)) fsn.value = curSym;
 }
 
 function filteredTrades() {
-  const fs = $('filterStrategy').value, fsn = $('filterSymbol').value, fFrom = $('filterFrom').value, fTo = $('filterTo').value;
+  const fs = $('filterSession').value, fsn = $('filterSymbol').value, fFrom = $('filterFrom').value, fTo = $('filterTo').value;
   return state.trades.filter(t => {
-    if (fs && t.strategy !== fs) return false;
+    if (fs && t.session !== fs) return false;
     if (fsn && t.symbol !== fsn) return false;
-    const date = t.exit_date || t.entry_date;
+    const date = (t.created_at || '').split('T')[0];
     if (fFrom && date < fFrom) return false;
     if (fTo && date > fTo) return false;
     return true;
@@ -538,30 +663,28 @@ function filteredTrades() {
 
 function renderTable(rows) {
   const all = filteredTrades();
-  const sorted = [...all].sort((a, b) => new Date(b.exit_date || b.entry_date || 0) - new Date(a.exit_date || a.entry_date || 0));
-  let html = `<thead><tr><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Precio E</th><th>Precio S</th><th>Cant.</th><th>PnL</th><th>R</th><th>Estrategia</th><th>Gráfico</th><th></th></tr></thead><tbody>`;
+  const sorted = [...all].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  let html = `<thead><tr><th>Fecha</th><th>Activo</th><th>Dir.</th><th>Sesión</th><th>Setup</th><th>Resultado</th><th>Pips</th><th>Lotaje</th><th>PnL</th><th>R</th><th>Gráfico</th><th></th></tr></thead><tbody>`;
   if (!sorted.length) html += `<tr><td colspan="12" class="mut">Sin operaciones.</td></tr>`;
   for (const t of sorted) {
-    const closed = t.exit_price != null && t.entry_price != null && t.quantity != null;
-    const dir = t.side === 'long' ? 1 : -1;
-    const pnl = closed ? (t.exit_price - t.entry_price) * t.quantity * dir - (t.fees || 0) : null;
-    const risk = t.stop_loss ? Math.abs(t.entry_price - t.stop_loss) * t.quantity : null;
-    const r = closed && risk ? pnl / risk : null;
+    const pnl = calcPnL(t);
+    const risk = t.risk_pips ? t.risk_pips * (t.pip_value || 10) * t.lot_size : null;
+    const r = (pnl != null && risk) ? pnl / risk : null;
     const cls = pnl == null ? '' : (pnl >= 0 ? 'pos' : 'neg');
-    
     const imgBtn = t.has_image ? `<button class="ghost" onclick="viewImage(${t.id})">📸 Ver</button>` : '—';
+    const fecha = t.created_at ? new Date(t.created_at).toLocaleDateString() : '—';
 
     html += `<tr>
+      <td>${fecha}</td>
       <td><strong>${t.symbol}</strong></td>
       <td>${t.side === 'long' ? '🟢 L' : '🔴 S'}</td>
-      <td>${t.entry_date || '—'}</td>
-      <td>${t.exit_date || 'abierta'}</td>
-      <td>${fmt(t.entry_price, 4)}</td>
-      <td>${t.exit_price == null ? '—' : fmt(t.exit_price, 4)}</td>
-      <td>${fmt(t.quantity)}</td>
+      <td>${t.session || '—'}</td>
+      <td>${t.setup || '—'}</td>
+      <td>${t.result || '—'}</td>
+      <td>${t.pips != null ? fmt(t.pips) : '—'}</td>
+      <td>${fmt(t.lot_size)}</td>
       <td class="${cls}">${pnl == null ? '—' : money(pnl)}</td>
       <td class="${cls}">${r == null ? '—' : fmt(r) + 'R'}</td>
-      <td>${t.strategy || '—'}</td>
       <td>${imgBtn}</td>
       <td>${state.publicMode ? '' : `<button class="ghost" onclick="openForm(${t.id})">✎</button> <button class="danger" onclick="delTrade(${t.id})">🗑</button>`}</td>
     </tr>`;
@@ -572,7 +695,7 @@ function renderTable(rows) {
 function renderAll() {
   renderFilters();
   const m = computeMetrics(filteredTrades());
-  renderMetrics(m); renderChart(m.curve); renderTable(m.rows);
+  renderMetrics(m); renderEdge(m); renderChart(m.curve); renderTable(m.rows);
 }
 
 function handleImageUpload(event) {
@@ -613,11 +736,30 @@ function openForm(id) {
   const t = id ? state.trades.find(x => x.id === id) : null;
   $('formTitle').textContent = t ? 'Editar operación' : 'Nueva operación';
   $('tradeId').value = t ? t.id : '';
-  ['symbol','side','entry_date','exit_date','entry_price','exit_price','quantity','stop_loss','take_profit','fees','strategy','notes'].forEach(k => {
-    $(k).value = t && t[k] != null ? t[k] : (k === 'fees' ? 0 : '');
-  });
-  if (!t) $('side').value = 'long';
   
+  // Llenar campos
+  const fields = ['symbol','side','session','setup','result','pips','lot_size','pip_value','risk_pips','notes'];
+  fields.forEach(k => {
+    if (t && t[k] != null) {
+      $(k).value = t[k];
+    } else {
+      // Valores por defecto
+      if (k === 'pip_value') $(k).value = 10;
+      else if (k === 'side') $(k).value = 'long';
+      else if (k === 'session') $(k).value = 'Londres';
+      else if (k === 'setup') $(k).value = '1';
+      else if (k === 'result') $(k).value = 'TP Full';
+      else $(k).value = '';
+    }
+  });
+  
+  // Manejar fecha
+  if (t && t.created_at) {
+      $('created_at').value = t.created_at.slice(0, 16); // Formato datetime-local
+  } else {
+      $('created_at').value = new Date().toISOString().slice(0, 16);
+  }
+
   state.currentImageBase64 = null;
   $('chart_image_input').value = '';
   $('image_preview').classList.add('hidden');
@@ -629,12 +771,16 @@ function closeForm() { $('modal').classList.remove('open'); }
 async function saveTrade() {
   const id = $('tradeId').value;
   const body = {
-    symbol: $('symbol').value.trim().toUpperCase(), side: $('side').value,
-    entry_date: $('entry_date').value || null, exit_date: $('exit_date').value || null,
-    entry_price: parseNum($('entry_price').value), exit_price: parseNum($('exit_price').value),
-    quantity: parseNum($('quantity').value), stop_loss: parseNum($('stop_loss').value),
-    take_profit: parseNum($('take_profit').value), fees: parseNum($('fees').value) || 0,
-    strategy: $('strategy').value.trim() || null, notes: $('notes').value.trim() || null,
+    symbol: $('symbol').value.trim().toUpperCase(),
+    side: $('side').value,
+    session: $('session').value,
+    setup: $('setup').value,
+    result: $('result').value,
+    pips: parseNum($('pips').value),
+    lot_size: parseNum($('lot_size').value),
+    pip_value: parseNum($('pip_value').value) || 10,
+    risk_pips: parseNum($('risk_pips').value),
+    notes: $('notes').value.trim() || null,
     chart_image: state.currentImageBase64
   };
   if (!body.symbol) { alert('El símbolo es obligatorio'); return; }
