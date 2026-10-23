@@ -1,56 +1,76 @@
-import sqlite3, hashlib, secrets
+import sqlite3, hashlib, secrets, os
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+import libsql_client
 
-DB = "journal.db"
 app = FastAPI(title="Bitácora de Trading")
 
-# ---------- Base de datos ----------
+# ---------- Configuración de Base de Datos ----------
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
+DB = "journal.db"
+
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    if USE_TURSO:
+        client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_TOKEN)
+        try:
+            yield client
+        finally:
+            client.close()
+    else:
+        conn = sqlite3.connect(DB)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
-with get_db() as c:
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        share_token TEXT UNIQUE,
-        is_public INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS tokens(
-        token TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS trades(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        entry_date TEXT,
-        exit_date TEXT,
-        entry_price REAL,
-        exit_price REAL,
-        quantity REAL,
-        stop_loss REAL,
-        take_profit REAL,
-        fees REAL DEFAULT 0,
-        strategy TEXT,
-        notes TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
+def db_execute(query, params=(), fetch=False):
+    with get_db() as c:
+        if USE_TURSO:
+            res = c.execute(query, list(params))
+            if fetch: return [dict(row) for row in res.rows]
+            return res
+        else:
+            cur = c.execute(query, params)
+            if fetch: return [dict(row) for row in cur.fetchall()]
+            return cur
+
+def init_db():
+    with get_db() as c:
+        if USE_TURSO:
+            c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0)")
+            c.execute("CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)")
+            c.execute("""CREATE TABLE IF NOT EXISTS trades(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
+                stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
+                chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        else:
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS trades(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
+                stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
+                chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            """)
+    
+    # Intentar agregar la columna a bases de datos viejas (por si acaso)
+    try:
+        db_execute("ALTER TABLE trades ADD COLUMN chart_image TEXT")
+    except Exception:
+        pass
+
+init_db()
 
 def hash_pw(pw):
     salt = secrets.token_hex(16)
@@ -65,11 +85,9 @@ def current_user(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "No autenticado")
     token = authorization[7:]
-    with get_db() as c:
-        row = c.execute("SELECT user_id FROM tokens WHERE token=?", (token,)).fetchone()
-    if not row:
-        raise HTTPException(401, "Token inválido")
-    return row["user_id"]
+    rows = db_execute("SELECT user_id FROM tokens WHERE token=?", (token,), fetch=True)
+    if not rows: raise HTTPException(401, "Token inválido")
+    return rows[0]["user_id"]
 
 # ---------- Modelos ----------
 class AuthIn(BaseModel):
@@ -89,99 +107,89 @@ class TradeIn(BaseModel):
     fees: Optional[float] = 0
     strategy: Optional[str] = None
     notes: Optional[str] = None
+    chart_image: Optional[str] = None # <--- NUEVO CAMPO
 
 class ShareIn(BaseModel):
     enabled: bool
 
-# ---------- Auth ----------
+# ---------- Rutas Auth ----------
 @app.post("/api/register")
 def register(data: AuthIn):
-    if len(data.username) < 3 or len(data.password) < 6:
-        raise HTTPException(400, "Usuario mínimo 3 y contraseña mínimo 6 caracteres")
-    with get_db() as c:
-        try:
-            cur = c.execute("INSERT INTO users(username, password_hash, share_token) VALUES(?,?,?)",
-                            (data.username, hash_pw(data.password), secrets.token_urlsafe(16)))
-        except sqlite3.IntegrityError:
-            raise HTTPException(400, "El usuario ya existe")
-        user_id = cur.lastrowid
+    if len(data.username) < 3 or len(data.password) < 6: raise HTTPException(400, "Usuario mínimo 3 y contraseña mínimo 6")
+    try:
+        db_execute("INSERT INTO users(username, password_hash, share_token) VALUES(?,?,?)", (data.username, hash_pw(data.password), secrets.token_urlsafe(16)))
+        user = db_execute("SELECT id FROM users WHERE username=?", (data.username,), fetch=True)[0]
         token = secrets.token_urlsafe(32)
-        c.execute("INSERT INTO tokens(token, user_id) VALUES(?,?)", (token, user_id))
-    return {"token": token, "username": data.username}
+        db_execute("INSERT INTO tokens(token, user_id) VALUES(?,?)", (token, user["id"]))
+        return {"token": token, "username": data.username}
+    except Exception as e:
+        if "UNIQUE" in str(e): raise HTTPException(400, "El usuario ya existe")
+        raise HTTPException(500, str(e))
 
 @app.post("/api/login")
 def login(data: AuthIn):
-    with get_db() as c:
-        row = c.execute("SELECT * FROM users WHERE username=?", (data.username,)).fetchone()
-        if not row or not check_pw(data.password, row["password_hash"]):
-            raise HTTPException(401, "Credenciales incorrectas")
-        token = secrets.token_urlsafe(32)
-        c.execute("INSERT INTO tokens(token, user_id) VALUES(?,?)", (token, row["id"]))
-    return {"token": token, "username": row["username"]}
+    rows = db_execute("SELECT * FROM users WHERE username=?", (data.username,), fetch=True)
+    if not rows or not check_pw(data.password, rows[0]["password_hash"]): raise HTTPException(401, "Credenciales incorrectas")
+    token = secrets.token_urlsafe(32)
+    db_execute("INSERT INTO tokens(token, user_id) VALUES(?,?)", (token, rows[0]["id"]))
+    return {"token": token, "username": rows[0]["username"]}
 
 @app.get("/api/me")
-def me(user_id: int = None, authorization: str = Header(None)):
+def me(authorization: str = Header(None)):
     uid = current_user(authorization)
-    with get_db() as c:
-        row = c.execute("SELECT id, username, share_token, is_public FROM users WHERE id=?", (uid,)).fetchone()
-    return dict(row)
+    return db_execute("SELECT id, username, share_token, is_public FROM users WHERE id=?", (uid,), fetch=True)[0]
 
-# ---------- Trades ----------
+# ---------- Rutas Trades ----------
 @app.get("/api/trades")
 def list_trades(authorization: str = Header(None)):
     uid = current_user(authorization)
-    with get_db() as c:
-        rows = c.execute("SELECT * FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (uid,)).fetchall()
-    return [dict(r) for r in rows]
+    # No traemos la imagen entera acá para que la carga sea rápida
+    return db_execute("SELECT id, user_id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, (chart_image IS NOT NULL) as has_image FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (uid,), fetch=True)
+
+@app.get("/api/trades/{trade_id}/image")
+def get_trade_image(trade_id: int, authorization: str = Header(None)):
+    uid = current_user(authorization)
+    rows = db_execute("SELECT chart_image FROM trades WHERE id=? AND user_id=?", (trade_id, uid), fetch=True)
+    if not rows or not rows[0]["chart_image"]: raise HTTPException(404, "Sin imagen")
+    return {"image": rows[0]["chart_image"]}
 
 @app.post("/api/trades")
 def create_trade(t: TradeIn, authorization: str = Header(None)):
     uid = current_user(authorization)
-    with get_db() as c:
-        cur = c.execute("""INSERT INTO trades(user_id, symbol, side, entry_date, exit_date, entry_price,
-            exit_price, quantity, stop_loss, take_profit, fees, strategy, notes)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (uid, t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price,
-             t.quantity, t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes))
-        return {"id": cur.lastrowid}
+    db_execute("""INSERT INTO trades(user_id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, chart_image)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (uid, t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price, t.quantity, t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes, t.chart_image))
+    return {"ok": True}
 
 @app.put("/api/trades/{trade_id}")
 def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
     uid = current_user(authorization)
-    with get_db() as c:
-        cur = c.execute("""UPDATE trades SET symbol=?, side=?, entry_date=?, exit_date=?, entry_price=?,
-            exit_price=?, quantity=?, stop_loss=?, take_profit=?, fees=?, strategy=?, notes=?
-            WHERE id=? AND user_id=?""",
-            (t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price, t.quantity,
-             t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes, trade_id, uid))
-        if cur.rowcount == 0:
-            raise HTTPException(404, "Operación no encontrada")
+    # Si t.chart_image es None, mantenemos la imagen anterior
+    db_execute("""UPDATE trades SET symbol=?, side=?, entry_date=?, exit_date=?, entry_price=?, exit_price=?, quantity=?, stop_loss=?, take_profit=?, fees=?, strategy=?, notes=?, chart_image=COALESCE(?, chart_image)
+        WHERE id=? AND user_id=?""",
+        (t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price, t.quantity, t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes, t.chart_image, trade_id, uid))
     return {"ok": True}
 
 @app.delete("/api/trades/{trade_id}")
 def delete_trade(trade_id: int, authorization: str = Header(None)):
     uid = current_user(authorization)
-    with get_db() as c:
-        c.execute("DELETE FROM trades WHERE id=? AND user_id=?", (trade_id, uid))
+    db_execute("DELETE FROM trades WHERE id=? AND user_id=?", (trade_id, uid))
     return {"ok": True}
 
-# ---------- Compartir ----------
+# ---------- Rutas Compartir ----------
 @app.post("/api/share")
 def toggle_share(data: ShareIn, authorization: str = Header(None)):
     uid = current_user(authorization)
-    with get_db() as c:
-        c.execute("UPDATE users SET is_public=? WHERE id=?", (1 if data.enabled else 0, uid))
-        row = c.execute("SELECT share_token FROM users WHERE id=?", (uid,)).fetchone()
-    return {"enabled": data.enabled, "share_token": row["share_token"]}
+    db_execute("UPDATE users SET is_public=? WHERE id=?", (1 if data.enabled else 0, uid))
+    rows = db_execute("SELECT share_token FROM users WHERE id=?", (uid,), fetch=True)
+    return {"enabled": data.enabled, "share_token": rows[0]["share_token"]}
 
 @app.get("/api/public/{share_token}")
 def public_view(share_token: str):
-    with get_db() as c:
-        user = c.execute("SELECT id, username, is_public FROM users WHERE share_token=?", (share_token,)).fetchone()
-        if not user or not user["is_public"]:
-            raise HTTPException(404, "Bitácora no disponible")
-        rows = c.execute("SELECT * FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (user["id"],)).fetchall()
-    return {"username": user["username"], "trades": [dict(r) for r in rows]}
+    users = db_execute("SELECT id, username, is_public FROM users WHERE share_token=?", (share_token,), fetch=True)
+    if not users or not users[0]["is_public"]: raise HTTPException(404, "Bitácora no disponible")
+    trades = db_execute("SELECT id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, (chart_image IS NOT NULL) as has_image FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (users[0]["id"],), fetch=True)
+    return {"username": users[0]["username"], "trades": trades}
 
 # ---------- Frontend ----------
 HTML = r"""
@@ -199,10 +207,10 @@ HTML = r"""
   h1{font-size:18px;margin:0} .mut{color:var(--mut);font-size:13px}
   .container{max-width:1200px;margin:0 auto;padding:22px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
   .metric{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
-  .metric .v{font-size:22px;font-weight:600;margin-top:4px}
-  .metric .l{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+  .metric .v{font-size:20px;font-weight:600;margin-top:4px}
+  .metric .l{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
   .pos{color:var(--acc)} .neg{color:var(--neg)}
   button{background:var(--blue);color:#04121f;border:none;padding:9px 14px;border-radius:8px;font-weight:600;cursor:pointer}
   button.ghost{background:transparent;color:var(--txt);border:1px solid var(--line)}
@@ -213,13 +221,15 @@ HTML = r"""
   th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
   th{color:var(--mut);font-weight:500;font-size:12px;text-transform:uppercase}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;padding:20px;z-index:50}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;padding:20px;z-index:50}
   .modal.open{display:flex}
   .modal .card{max-width:640px;width:100%;max-height:90vh;overflow:auto}
+  .modal-img{max-width:95vw;max-height:95vh;border-radius:8px}
   .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   .hidden{display:none!important}
   a{color:var(--blue)}
   .banner{background:#1f2a12;border:1px solid #3fb95033;color:var(--acc);padding:8px 12px;border-radius:8px;font-size:13px}
+  .img-preview{max-width:100%;max-height:200px;border-radius:8px;margin-top:8px;object-fit:contain;background:#0b1219}
 </style>
 </head>
 <body>
@@ -234,7 +244,7 @@ HTML = r"""
 <div class="container" id="authView">
   <div class="card" style="max-width:420px;margin:60px auto">
     <h1 id="authTitle">Ingresar</h1>
-    <p class="mut" id="authHelp">Creá una cuenta o iniciá sesión para empezar.</p>
+    <p class="mut" id="authHelp">Creá una cuenta o iniciá sesión.</p>
     <label>Usuario<input id="username" autocomplete="username"></label>
     <label style="display:block;margin-top:10px">Contraseña<input id="password" type="password" autocomplete="current-password"></label>
     <div class="row" style="margin-top:16px">
@@ -247,23 +257,23 @@ HTML = r"""
 
 <div class="container hidden" id="appView">
   <div id="publicBanner" class="banner hidden"></div>
-
   <div class="grid" id="metricsGrid"></div>
-
   <div class="card">
-    <div class="row" style="justify-content:space-between">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
       <strong>Curva de capital</strong>
-      <span class="mut" id="chartHint">Operaciones cerradas</span>
+      <div class="row">
+        <label style="margin:0">Desde: <input type="date" id="filterFrom" onchange="renderAll()" style="width:auto;padding:4px"></label>
+        <label style="margin:0">Hasta: <input type="date" id="filterTo" onchange="renderAll()" style="width:auto;padding:4px"></label>
+      </div>
     </div>
     <canvas id="equityChart" height="90"></canvas>
   </div>
-
   <div class="card">
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
       <strong>Operaciones</strong>
       <div class="row">
-        <select id="filterStrategy" onchange="renderAll()" style="width:160px"></select>
-        <select id="filterSymbol" onchange="renderAll()" style="width:130px"></select>
+        <select id="filterStrategy" onchange="renderAll()" style="width:140px"></select>
+        <select id="filterSymbol" onchange="renderAll()" style="width:120px"></select>
         <button id="addBtn" onclick="openForm()">+ Nueva operación</button>
       </div>
     </div>
@@ -271,6 +281,7 @@ HTML = r"""
   </div>
 </div>
 
+<!-- Modal Formulario -->
 <div class="modal" id="modal">
   <div class="card">
     <div class="row" style="justify-content:space-between"><strong id="formTitle">Nueva operación</strong>
@@ -287,9 +298,16 @@ HTML = r"""
       <div><label>Stop loss</label><input id="stop_loss" type="number" step="any"></div>
       <div><label>Take profit</label><input id="take_profit" type="number" step="any"></div>
       <div><label>Comisiones</label><input id="fees" type="number" step="any" value="0"></div>
-      <div><label>Estrategia</label><input id="strategy" placeholder="Breakout, reversión..."></div>
+      <div><label>Estrategia</label><input id="strategy" placeholder="Breakout..."></div>
       <div><label>Notas</label><input id="notes" placeholder="Observaciones"></div>
     </div>
+    
+    <div style="margin-top:12px">
+      <label>Captura de TradingView (Opcional)</label>
+      <input type="file" id="chart_image_input" accept="image/*" onchange="handleImageUpload(event)" style="background:transparent;border:none;padding-left:0">
+      <img id="image_preview" class="img-preview hidden" src="">
+    </div>
+
     <div class="row" style="margin-top:16px;justify-content:flex-end">
       <button class="ghost" onclick="closeForm()">Cancelar</button>
       <button onclick="saveTrade()">Guardar</button>
@@ -297,9 +315,17 @@ HTML = r"""
   </div>
 </div>
 
+<!-- Modal para ver Imagen en Grande -->
+<div class="modal" id="imageModal" onclick="closeImage()">
+  <div style="text-align:center">
+    <img id="fullImage" class="modal-img" src="">
+    <br><button class="ghost" style="margin-top:10px" onclick="closeImage()">Cerrar</button>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
-const state = { token: localStorage.getItem('token'), user: null, trades: [], publicMode: false, chart: null, authMode: 'login' };
+const state = { token: localStorage.getItem('token'), user: null, trades: [], publicMode: false, chart: null, authMode: 'login', currentImageBase64: null };
 
 async function api(path, opts = {}) {
   opts.headers = Object.assign({'Content-Type': 'application/json'}, opts.headers || {});
@@ -314,133 +340,98 @@ function switchAuth() {
   $('authTitle').textContent = state.authMode === 'login' ? 'Ingresar' : 'Crear cuenta';
   $('submitAuth').textContent = state.authMode === 'login' ? 'Ingresar' : 'Registrarme';
   $('switchLabel').textContent = state.authMode === 'login' ? 'Crear cuenta' : 'Ya tengo cuenta';
-  $('authHelp').textContent = state.authMode === 'login' ? 'Ingresá con tu usuario y contraseña.' : 'Elegí usuario (mín. 3) y contraseña (mín. 6).';
   $('authError').textContent = '';
 }
 
 async function doAuth() {
-  const username = $('username').value.trim();
-  const password = $('password').value;
+  const username = $('username').value.trim(), password = $('password').value;
   $('authError').textContent = '';
   try {
-    const data = await api('/api/' + (state.authMode === 'login' ? 'login' : 'register'), {
-      method: 'POST', body: JSON.stringify({username, password})
-    });
-    state.token = data.token;
-    localStorage.setItem('token', data.token);
-    await boot();
+    const data = await api('/api/' + (state.authMode === 'login' ? 'login' : 'register'), { method: 'POST', body: JSON.stringify({username, password}) });
+    state.token = data.token; localStorage.setItem('token', data.token); await boot();
   } catch (e) { $('authError').textContent = e.message; }
 }
 
 function logout() {
-  localStorage.removeItem('token');
-  state.token = null; state.user = null; state.trades = [];
-  $('appView').classList.add('hidden');
-  $('authView').classList.remove('hidden');
-  $('userLabel').textContent = '';
-  $('shareBtn').classList.add('hidden');
-  $('logoutBtn').classList.add('hidden');
+  localStorage.removeItem('token'); state.token = null; state.user = null; state.trades = [];
+  $('appView').classList.add('hidden'); $('authView').classList.remove('hidden');
+  $('userLabel').textContent = ''; $('shareBtn').classList.add('hidden'); $('logoutBtn').classList.add('hidden');
 }
 
 async function boot() {
-  const path = location.pathname;
-  if (path.startsWith('/share/')) {
+  if (location.pathname.startsWith('/share/')) {
     state.publicMode = true;
-    const token = path.split('/share/')[1];
     try {
-      const data = await api('/api/public/' + token);
+      const data = await api('/api/public/' + location.pathname.split('/share/')[1]);
       state.trades = data.trades;
       $('userLabel').textContent = 'Vista pública de @' + data.username;
       $('publicBanner').classList.remove('hidden');
-      $('publicBanner').textContent = 'Estás viendo una bitácora compartida en modo solo lectura.';
-      $('authView').classList.add('hidden');
-      $('appView').classList.remove('hidden');
-      $('addBtn').classList.add('hidden');
-      renderAll();
-    } catch (e) {
-      $('authView').classList.remove('hidden');
-      $('authError').textContent = 'Enlace no válido o bitácora no pública.';
-    }
+      $('publicBanner').textContent = 'Bitácora compartida en modo solo lectura.';
+      $('authView').classList.add('hidden'); $('appView').classList.remove('hidden');
+      $('addBtn').classList.add('hidden'); renderAll();
+    } catch (e) { $('authView').classList.remove('hidden'); $('authError').textContent = 'Enlace no válido.'; }
     return;
   }
   if (!state.token) { $('authView').classList.remove('hidden'); return; }
   try {
-    state.user = await api('/api/me');
-    state.trades = await api('/api/trades');
-    $('authView').classList.add('hidden');
-    $('appView').classList.remove('hidden');
+    state.user = await api('/api/me'); state.trades = await api('/api/trades');
+    $('authView').classList.add('hidden'); $('appView').classList.remove('hidden');
     $('userLabel').textContent = '@' + state.user.username;
-    $('logoutBtn').classList.remove('hidden');
-    $('shareBtn').classList.remove('hidden');
-    updateShareBtn();
-    renderAll();
-  } catch (e) {
-    logout();
-  }
+    $('logoutBtn').classList.remove('hidden'); $('shareBtn').classList.remove('hidden');
+    updateShareBtn(); renderAll();
+  } catch (e) { logout(); }
 }
 
-function updateShareBtn() {
-  const b = $('shareBtn');
-  b.textContent = state.user?.is_public ? '🔗 Compartida (copiar enlace)' : 'Compartir';
-}
+function updateShareBtn() { $('shareBtn').textContent = state.user?.is_public ? '🔗 Compartida' : 'Compartir'; }
 
 async function toggleShare() {
   if (!state.user) return;
   if (state.user.is_public) {
     const url = location.origin + '/share/' + state.user.share_token;
-    navigator.clipboard?.writeText(url);
-    alert('Enlace copiado:\n' + url + '\n\nDesactivá la compartición con doble clic en este botón.');
-    return;
+    navigator.clipboard?.writeText(url); alert('Enlace copiado:\n' + url); return;
   }
   const data = await api('/api/share', {method: 'POST', body: JSON.stringify({enabled: true})});
-  state.user.is_public = 1; state.user.share_token = data.share_token;
-  updateShareBtn();
+  state.user.is_public = 1; state.user.share_token = data.share_token; updateShareBtn();
   const url = location.origin + '/share/' + data.share_token;
-  navigator.clipboard?.writeText(url);
-  alert('¡Bitácora pública! Enlace copiado:\n' + url);
+  navigator.clipboard?.writeText(url); alert('¡Bitácora pública! Enlace copiado:\n' + url);
 }
 
-// ---------- Métricas ----------
 function computeMetrics(trades) {
   const closed = trades.filter(t => t.exit_price != null && t.exit_date && t.entry_price != null && t.quantity != null);
   const rows = closed.map(t => {
     const dir = t.side === 'long' ? 1 : -1;
     const pnl = (t.exit_price - t.entry_price) * t.quantity * dir - (t.fees || 0);
     const risk = t.stop_loss ? Math.abs(t.entry_price - t.stop_loss) * t.quantity : null;
-    return {...t, pnl, r: risk ? pnl / risk : null};
+    let durationDays = 0;
+    if (t.entry_date && t.exit_date) durationDays = (new Date(t.exit_date) - new Date(t.entry_date)) / (1000 * 60 * 60 * 24);
+    return {...t, pnl, r: risk ? pnl / risk : null, durationDays};
   }).sort((a, b) => new Date(a.exit_date) - new Date(b.exit_date));
 
-  const wins = rows.filter(r => r.pnl > 0);
-  const losses = rows.filter(r => r.pnl < 0);
-  const grossProfit = wins.reduce((s, r) => s + r.pnl, 0);
-  const grossLoss = Math.abs(losses.reduce((s, r) => s + r.pnl, 0));
+  const wins = rows.filter(r => r.pnl > 0), losses = rows.filter(r => r.pnl < 0);
+  const grossProfit = wins.reduce((s, r) => s + r.pnl, 0), grossLoss = Math.abs(losses.reduce((s, r) => s + r.pnl, 0));
   const netPnl = rows.reduce((s, r) => s + r.pnl, 0);
 
-  // curva de capital y drawdown
-  let equity = 0, peak = 0, maxDD = 0;
-  const curve = [{date: 'Inicio', value: 0}];
+  let maxWinStreak = 0, maxLossStreak = 0, currentStreak = 0;
   rows.forEach(r => {
-    equity += r.pnl;
-    peak = Math.max(peak, equity);
-    maxDD = Math.max(maxDD, peak - equity);
-    curve.push({date: r.exit_date, value: equity});
+    if (r.pnl > 0) { currentStreak = currentStreak > 0 ? currentStreak + 1 : 1; maxWinStreak = Math.max(maxWinStreak, currentStreak); }
+    else if (r.pnl < 0) { currentStreak = currentStreak < 0 ? currentStreak - 1 : -1; maxLossStreak = Math.max(maxLossStreak, Math.abs(currentStreak)); }
   });
 
+  const longs = rows.filter(r => r.side === 'long'), shorts = rows.filter(r => r.side === 'short');
+  const winRateLong = longs.length ? (longs.filter(r => r.pnl > 0).length / longs.length) * 100 : 0;
+  const winRateShort = shorts.length ? (shorts.filter(r => r.pnl > 0).length / shorts.length) * 100 : 0;
+  const avgDuration = rows.length ? rows.reduce((s, r) => s + r.durationDays, 0) / rows.length : 0;
+
+  let equity = 0, peak = 0, maxDD = 0; const curve = [{date: 'Inicio', value: 0}];
+  rows.forEach(r => { equity += r.pnl; peak = Math.max(peak, equity); maxDD = Math.max(maxDD, peak - equity); curve.push({date: r.exit_date, value: equity}); });
   const rs = rows.filter(r => r.r != null).map(r => r.r);
-  const avgR = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
 
   return {
-    count: rows.length,
-    winRate: rows.length ? (wins.length / rows.length) * 100 : 0,
+    count: rows.length, winRate: rows.length ? (wins.length / rows.length) * 100 : 0,
     profitFactor: grossLoss ? grossProfit / grossLoss : (grossProfit ? Infinity : 0),
-    netPnl,
-    expectancy: rows.length ? netPnl / rows.length : 0,
-    avgWin: wins.length ? grossProfit / wins.length : 0,
-    avgLoss: losses.length ? -grossLoss / losses.length : 0,
-    maxDD,
-    avgR,
-    curve,
-    rows
+    netPnl, expectancy: rows.length ? netPnl / rows.length : 0,
+    avgWin: wins.length ? grossProfit / wins.length : 0, avgLoss: losses.length ? -grossLoss / losses.length : 0,
+    maxDD, avgR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null, curve, rows, maxWinStreak, maxLossStreak, winRateLong, winRateShort, avgDuration
   };
 }
 
@@ -450,50 +441,29 @@ function money(n) { return (n >= 0 ? '+' : '') + fmt(n); }
 
 function renderMetrics(m) {
   const cards = [
-    ['Operaciones', m.count, ''],
-    ['Win rate', pct(m.winRate), ''],
-    ['Profit factor', m.profitFactor === Infinity ? '∞' : fmt(m.profitFactor), ''],
-    ['PnL neto', money(m.netPnl), m.netPnl >= 0 ? 'pos' : 'neg'],
-    ['Expectancy', money(m.expectancy), m.expectancy >= 0 ? 'pos' : 'neg'],
-    ['Avg R', m.avgR == null ? '—' : fmt(m.avgR), m.avgR >= 0 ? 'pos' : 'neg'],
-    ['Max drawdown', fmt(m.maxDD), 'neg'],
-    ['Avg win / loss', money(m.avgWin) + ' / ' + money(m.avgLoss), '']
+    ['Operaciones', m.count, ''], ['Win Rate', pct(m.winRate), ''], ['Profit Factor', m.profitFactor === Infinity ? '∞' : fmt(m.profitFactor), ''],
+    ['PnL Neto', money(m.netPnl), m.netPnl >= 0 ? 'pos' : 'neg'], ['Expectancy', money(m.expectancy), m.expectancy >= 0 ? 'pos' : 'neg'],
+    ['Avg R', m.avgR == null ? '—' : fmt(m.avgR), m.avgR >= 0 ? 'pos' : 'neg'], ['Max Drawdown', fmt(m.maxDD), 'neg'],
+    ['Avg Win / Loss', money(m.avgWin) + ' / ' + money(m.avgLoss), ''],
+    ['Racha Max Wins', m.maxWinStreak, 'pos'], ['Racha Max Losses', m.maxLossStreak, 'neg'],
+    ['Win Rate Long', pct(m.winRateLong), ''], ['Win Rate Short', pct(m.winRateShort), ''],
+    ['Duración Media', fmt(m.avgDuration, 1) + ' días', '']
   ];
-  $('metricsGrid').innerHTML = cards.map(c =>
-    `<div class="metric"><div class="l">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`
-  ).join('');
+  $('metricsGrid').innerHTML = cards.map(c => `<div class="metric"><div class="l">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
 }
 
 function renderChart(curve) {
-  const ctx = $('equityChart').getContext('2d');
   if (state.chart) state.chart.destroy();
-  state.chart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: curve.map(p => p.date),
-      datasets: [{
-        label: 'Capital acumulado',
-        data: curve.map(p => p.value),
-        borderColor: '#58a6ff',
-        backgroundColor: 'rgba(88,166,255,.15)',
-        fill: true, tension: .25, pointRadius: 2
-      }]
-    },
-    options: {
-      plugins: {legend: {display: false}},
-      scales: {
-        x: {ticks: {color: '#8aa0b4', maxTicksLimit: 8}, grid: {color: '#243140'}},
-        y: {ticks: {color: '#8aa0b4'}, grid: {color: '#243140'}}
-      }
-    }
+  state.chart = new Chart($('equityChart').getContext('2d'), {
+    type: 'line', data: { labels: curve.map(p => p.date), datasets: [{ label: 'Capital', data: curve.map(p => p.value), borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,.15)', fill: true, tension: .25, pointRadius: 2 }] },
+    options: { plugins: {legend: {display: false}}, scales: { x: {ticks: {color: '#8aa0b4', maxTicksLimit: 8}, grid: {color: '#243140'}}, y: {ticks: {color: '#8aa0b4'}, grid: {color: '#243140'}} } }
   });
 }
 
 function renderFilters() {
   const strategies = [...new Set(state.trades.map(t => t.strategy).filter(Boolean))].sort();
   const symbols = [...new Set(state.trades.map(t => t.symbol).filter(Boolean))].sort();
-  const fs = $('filterStrategy'), fsn = $('filterSymbol');
-  const curS = fs.value, curSym = fsn.value;
+  const fs = $('filterStrategy'), fsn = $('filterSymbol'), curS = fs.value, curSym = fsn.value;
   fs.innerHTML = '<option value="">Todas las estrategias</option>' + strategies.map(s => `<option value="${s}">${s}</option>`).join('');
   fsn.innerHTML = '<option value="">Todos los símbolos</option>' + symbols.map(s => `<option value="${s}">${s}</option>`).join('');
   if (strategies.includes(curS)) fs.value = curS;
@@ -501,17 +471,22 @@ function renderFilters() {
 }
 
 function filteredTrades() {
-  const fs = $('filterStrategy').value, fsn = $('filterSymbol').value;
-  return state.trades.filter(t => (!fs || t.strategy === fs) && (!fsn || t.symbol === fsn));
+  const fs = $('filterStrategy').value, fsn = $('filterSymbol').value, fFrom = $('filterFrom').value, fTo = $('filterTo').value;
+  return state.trades.filter(t => {
+    if (fs && t.strategy !== fs) return false;
+    if (fsn && t.symbol !== fsn) return false;
+    const date = t.exit_date || t.entry_date;
+    if (fFrom && date < fFrom) return false;
+    if (fTo && date > fTo) return false;
+    return true;
+  });
 }
 
 function renderTable(rows) {
   const all = filteredTrades();
   const sorted = [...all].sort((a, b) => new Date(b.exit_date || b.entry_date || 0) - new Date(a.exit_date || a.entry_date || 0));
-  let html = `<thead><tr>
-    <th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Precio E</th><th>Precio S</th>
-    <th>Cant.</th><th>PnL</th><th>R</th><th>Estrategia</th><th></th></tr></thead><tbody>`;
-  if (!sorted.length) html += `<tr><td colspan="11" class="mut">Sin operaciones todavía.</td></tr>`;
+  let html = `<thead><tr><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Precio E</th><th>Precio S</th><th>Cant.</th><th>PnL</th><th>R</th><th>Estrategia</th><th>Gráfico</th><th></th></tr></thead><tbody>`;
+  if (!sorted.length) html += `<tr><td colspan="12" class="mut">Sin operaciones.</td></tr>`;
   for (const t of sorted) {
     const closed = t.exit_price != null && t.entry_price != null && t.quantity != null;
     const dir = t.side === 'long' ? 1 : -1;
@@ -519,6 +494,10 @@ function renderTable(rows) {
     const risk = t.stop_loss ? Math.abs(t.entry_price - t.stop_loss) * t.quantity : null;
     const r = closed && risk ? pnl / risk : null;
     const cls = pnl == null ? '' : (pnl >= 0 ? 'pos' : 'neg');
+    
+    // Botón de imagen
+    const imgBtn = t.has_image ? `<button class="ghost" onclick="viewImage(${t.id})">📸 Ver</button>` : '—';
+
     html += `<tr>
       <td><strong>${t.symbol}</strong></td>
       <td>${t.side === 'long' ? '🟢 L' : '🔴 S'}</td>
@@ -530,21 +509,58 @@ function renderTable(rows) {
       <td class="${cls}">${pnl == null ? '—' : money(pnl)}</td>
       <td class="${cls}">${r == null ? '—' : fmt(r) + 'R'}</td>
       <td>${t.strategy || '—'}</td>
-      <td>${state.publicMode ? '' : `<button class="ghost" onclick="openForm(${t.id})">✎</button>
-        <button class="danger" onclick="delTrade(${t.id})">🗑</button>`}</td>
+      <td>${imgBtn}</td>
+      <td>${state.publicMode ? '' : `<button class="ghost" onclick="openForm(${t.id})">✎</button> <button class="danger" onclick="delTrade(${t.id})">🗑</button>`}</td>
     </tr>`;
   }
-  html += '</tbody>';
-  $('tradesTable').innerHTML = html;
+  $('tradesTable').innerHTML = html + '</tbody>';
 }
 
 function renderAll() {
   renderFilters();
   const m = computeMetrics(filteredTrades());
-  renderMetrics(m);
-  renderChart(m.curve);
-  renderTable(m.rows);
+  renderMetrics(m); renderChart(m.curve); renderTable(m.rows);
 }
+
+// ---------- Imágenes ----------
+function handleImageUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  // Comprimir imagen usando Canvas
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width, height = img.height;
+      const MAX_SIZE = 1000;
+      if (width > height && width > MAX_SIZE) { height *= MAX_SIZE / width; width = MAX_SIZE; }
+      else if (height > MAX_SIZE) { width *= MAX_SIZE / height; height = MAX_SIZE; }
+      
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      
+      // Calidad 0.7 (buen balance entre peso y calidad)
+      state.currentImageBase64 = canvas.toDataURL('image/jpeg', 0.7);
+      $('image_preview').src = state.currentImageBase64;
+      $('image_preview').classList.remove('hidden');
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+async function viewImage(id) {
+  try {
+    const data = await api('/api/trades/' + id + '/image');
+    $('fullImage').src = data.image;
+    $('imageModal').classList.add('open');
+  } catch (e) { alert('Error al cargar la imagen'); }
+}
+
+function closeImage() { $('imageModal').classList.remove('open'); }
 
 // ---------- Formulario ----------
 function openForm(id) {
@@ -555,6 +571,13 @@ function openForm(id) {
     $(k).value = t && t[k] != null ? t[k] : (k === 'fees' ? 0 : '');
   });
   if (!t) $('side').value = 'long';
+  
+  // Resetear imagen
+  state.currentImageBase64 = null;
+  $('chart_image_input').value = '';
+  $('image_preview').classList.add('hidden');
+  $('image_preview').src = '';
+  
   $('modal').classList.add('open');
 }
 function closeForm() { $('modal').classList.remove('open'); }
@@ -562,18 +585,13 @@ function closeForm() { $('modal').classList.remove('open'); }
 async function saveTrade() {
   const id = $('tradeId').value;
   const body = {
-    symbol: $('symbol').value.trim().toUpperCase(),
-    side: $('side').value,
-    entry_date: $('entry_date').value || null,
-    exit_date: $('exit_date').value || null,
-    entry_price: parseFloat($('entry_price').value) || null,
-    exit_price: parseFloat($('exit_price').value) || null,
-    quantity: parseFloat($('quantity').value) || null,
-    stop_loss: parseFloat($('stop_loss').value) || null,
-    take_profit: parseFloat($('take_profit').value) || null,
-    fees: parseFloat($('fees').value) || 0,
-    strategy: $('strategy').value.trim() || null,
-    notes: $('notes').value.trim() || null
+    symbol: $('symbol').value.trim().toUpperCase(), side: $('side').value,
+    entry_date: $('entry_date').value || null, exit_date: $('exit_date').value || null,
+    entry_price: parseFloat($('entry_price').value) || null, exit_price: parseFloat($('exit_price').value) || null,
+    quantity: parseFloat($('quantity').value) || null, stop_loss: parseFloat($('stop_loss').value) || null,
+    take_profit: parseFloat($('take_profit').value) || null, fees: parseFloat($('fees').value) || 0,
+    strategy: $('strategy').value.trim() || null, notes: $('notes').value.trim() || null,
+    chart_image: state.currentImageBase64 // Enviamos la imagen comprimida
   };
   if (!body.symbol) { alert('El símbolo es obligatorio'); return; }
   try {
@@ -587,22 +605,17 @@ async function saveTrade() {
 async function delTrade(id) {
   if (!confirm('¿Eliminar esta operación?')) return;
   await api('/api/trades/' + id, {method: 'DELETE'});
-  state.trades = await api('/api/trades');
-  renderAll();
+  state.trades = await api('/api/trades'); renderAll();
 }
 
-// inicial
-switchAuth();
-boot();
+switchAuth(); boot();
 </script>
 </body>
 </html>
 """
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return HTML
+def index(): return HTML
 
 @app.get("/share/{token}", response_class=HTMLResponse)
-def share_page(token: str):
-    return HTML
+def share_page(token: str): return HTML
