@@ -5,33 +5,26 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-
-# Importamos la librería correcta
-try:
-    import turso_serverless
-    TURSO_AVAILABLE = True
-except ImportError:
-    TURSO_AVAILABLE = False
+import libsql_client
 
 app = FastAPI(title="Bitácora de Trading")
 
 # ---------- Configuración de Base de Datos ----------
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
-USE_TURSO = TURSO_AVAILABLE and bool(TURSO_URL and TURSO_TOKEN)
+USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 DB = "journal.db"
 
 @contextmanager
 def get_db():
     if USE_TURSO:
-        # Conexión usando turso_serverless (HTTP)
-        conn = turso_serverless.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+        # libsql-client acepta libsql:// y lo normaliza a https internamente
+        client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_TOKEN)
         try:
-            yield conn
+            yield client
         finally:
-            conn.close()
+            client.close()
     else:
-        # Fallback local para pruebas
         conn = sqlite3.connect(DB)
         conn.row_factory = sqlite3.Row
         try:
@@ -43,27 +36,39 @@ def get_db():
 def db_execute(query, params=(), fetch=False):
     with get_db() as c:
         if USE_TURSO:
-            cur = c.execute(query, params)
-            if fetch:
-                return [dict(row) for row in cur.fetchall()]
-            c.commit()
-            return cur
+            res = c.execute(query, list(params))
+            if fetch: return [dict(row) for row in res.rows]
+            return res
         else:
             cur = c.execute(query, params)
-            if fetch:
-                return [dict(row) for row in cur.fetchall()]
+            if fetch: return [dict(row) for row in cur.fetchall()]
             return cur
 
 def init_db():
     with get_db() as c:
-        c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)")
-        c.execute("CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)")
-        c.execute("""CREATE TABLE IF NOT EXISTS trades(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
-            entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
-            stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
-            chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
-        c.commit()
+        if USE_TURSO:
+            c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)")
+            c.execute("CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)")
+            c.execute("""CREATE TABLE IF NOT EXISTS trades(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
+                stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
+                chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        else:
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000);
+            CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS trades(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, quantity REAL,
+                stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
+                chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            """)
+    # Añadir columnas si la tabla ya existe (para migraciones)
+    try: db_execute("ALTER TABLE trades ADD COLUMN chart_image TEXT")
+    except Exception: pass
+    try: db_execute("ALTER TABLE users ADD COLUMN initial_capital REAL DEFAULT 10000")
+    except Exception: pass
 
 init_db()
 
