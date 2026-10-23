@@ -18,7 +18,7 @@ DB = "journal.db"
 @contextmanager
 def get_db():
     if USE_TURSO:
-        client = libsql_client.create_client_sync(sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
+        client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_TOKEN)
         try:
             yield client
         finally:
@@ -46,7 +46,7 @@ def db_execute(query, params=(), fetch=False):
 def init_db():
     with get_db() as c:
         if USE_TURSO:
-            c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0)")
+            c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)")
             c.execute("CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)")
             c.execute("""CREATE TABLE IF NOT EXISTS trades(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
@@ -55,7 +55,7 @@ def init_db():
                 chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         else:
             c.executescript("""
-            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000);
             CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS trades(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
@@ -63,12 +63,11 @@ def init_db():
                 stop_loss REAL, take_profit REAL, fees REAL DEFAULT 0, strategy TEXT, notes TEXT, 
                 chart_image TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             """)
-    
-    # Intentar agregar la columna a bases de datos viejas (por si acaso)
-    try:
-        db_execute("ALTER TABLE trades ADD COLUMN chart_image TEXT")
-    except Exception:
-        pass
+    # Intentar agregar las columnas a bases de datos viejas
+    try: db_execute("ALTER TABLE trades ADD COLUMN chart_image TEXT")
+    except Exception: pass
+    try: db_execute("ALTER TABLE users ADD COLUMN initial_capital REAL DEFAULT 10000")
+    except Exception: pass
 
 init_db()
 
@@ -107,10 +106,13 @@ class TradeIn(BaseModel):
     fees: Optional[float] = 0
     strategy: Optional[str] = None
     notes: Optional[str] = None
-    chart_image: Optional[str] = None # <--- NUEVO CAMPO
+    chart_image: Optional[str] = None
 
 class ShareIn(BaseModel):
     enabled: bool
+
+class CapitalIn(BaseModel):
+    amount: float
 
 # ---------- Rutas Auth ----------
 @app.post("/api/register")
@@ -137,13 +139,18 @@ def login(data: AuthIn):
 @app.get("/api/me")
 def me(authorization: str = Header(None)):
     uid = current_user(authorization)
-    return db_execute("SELECT id, username, share_token, is_public FROM users WHERE id=?", (uid,), fetch=True)[0]
+    return db_execute("SELECT id, username, share_token, is_public, initial_capital FROM users WHERE id=?", (uid,), fetch=True)[0]
+
+@app.put("/api/settings")
+def update_settings(data: CapitalIn, authorization: str = Header(None)):
+    uid = current_user(authorization)
+    db_execute("UPDATE users SET initial_capital=? WHERE id=?", (data.amount, uid))
+    return {"ok": True}
 
 # ---------- Rutas Trades ----------
 @app.get("/api/trades")
 def list_trades(authorization: str = Header(None)):
     uid = current_user(authorization)
-    # No traemos la imagen entera acá para que la carga sea rápida
     return db_execute("SELECT id, user_id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, (chart_image IS NOT NULL) as has_image FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (uid,), fetch=True)
 
 @app.get("/api/trades/{trade_id}/image")
@@ -164,7 +171,6 @@ def create_trade(t: TradeIn, authorization: str = Header(None)):
 @app.put("/api/trades/{trade_id}")
 def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
     uid = current_user(authorization)
-    # Si t.chart_image es None, mantenemos la imagen anterior
     db_execute("""UPDATE trades SET symbol=?, side=?, entry_date=?, exit_date=?, entry_price=?, exit_price=?, quantity=?, stop_loss=?, take_profit=?, fees=?, strategy=?, notes=?, chart_image=COALESCE(?, chart_image)
         WHERE id=? AND user_id=?""",
         (t.symbol, t.side, t.entry_date, t.exit_date, t.entry_price, t.exit_price, t.quantity, t.stop_loss, t.take_profit, t.fees, t.strategy, t.notes, t.chart_image, trade_id, uid))
@@ -186,10 +192,10 @@ def toggle_share(data: ShareIn, authorization: str = Header(None)):
 
 @app.get("/api/public/{share_token}")
 def public_view(share_token: str):
-    users = db_execute("SELECT id, username, is_public FROM users WHERE share_token=?", (share_token,), fetch=True)
+    users = db_execute("SELECT id, username, is_public, initial_capital FROM users WHERE share_token=?", (share_token,), fetch=True)
     if not users or not users[0]["is_public"]: raise HTTPException(404, "Bitácora no disponible")
     trades = db_execute("SELECT id, symbol, side, entry_date, exit_date, entry_price, exit_price, quantity, stop_loss, take_profit, fees, strategy, notes, (chart_image IS NOT NULL) as has_image FROM trades WHERE user_id=? ORDER BY COALESCE(exit_date, entry_date) DESC", (users[0]["id"],), fetch=True)
-    return {"username": users[0]["username"], "trades": trades}
+    return {"username": users[0]["username"], "trades": trades, "initial_capital": users[0]["initial_capital"]}
 
 # ---------- Frontend ----------
 HTML = r"""
@@ -236,6 +242,7 @@ HTML = r"""
 <header>
   <div class="row"><strong>📓 Bitácora de Trading</strong><span id="userLabel" class="mut"></span></div>
   <div class="row" id="topActions">
+    <button class="ghost hidden" id="configBtn" onclick="openConfig()">⚙️ Config</button>
     <button class="ghost hidden" id="shareBtn" onclick="toggleShare()">Compartir</button>
     <button class="ghost hidden" id="logoutBtn" onclick="logout()">Salir</button>
   </div>
@@ -292,22 +299,20 @@ HTML = r"""
       <div><label>Dirección</label><select id="side"><option value="long">Long</option><option value="short">Short</option></select></div>
       <div><label>Fecha entrada</label><input id="entry_date" type="date"></div>
       <div><label>Fecha salida</label><input id="exit_date" type="date"></div>
-      <div><label>Precio entrada</label><input id="entry_price" type="number" step="any"></div>
-      <div><label>Precio salida</label><input id="exit_price" type="number" step="any"></div>
-      <div><label>Cantidad</label><input id="quantity" type="number" step="any"></div>
-      <div><label>Stop loss</label><input id="stop_loss" type="number" step="any"></div>
-      <div><label>Take profit</label><input id="take_profit" type="number" step="any"></div>
-      <div><label>Comisiones</label><input id="fees" type="number" step="any" value="0"></div>
+      <div><label>Precio entrada</label><input id="entry_price" type="text" placeholder="Ej: 1,11916"></div>
+      <div><label>Precio salida</label><input id="exit_price" type="text" placeholder="Ej: 1,11955"></div>
+      <div><label>Cantidad</label><input id="quantity" type="text" placeholder="Ej: 1"></div>
+      <div><label>Stop loss</label><input id="stop_loss" type="text" placeholder="Ej: 1,11937"></div>
+      <div><label>Take profit</label><input id="take_profit" type="text" placeholder="Ej: 1,11955"></div>
+      <div><label>Comisiones</label><input id="fees" type="text" value="0"></div>
       <div><label>Estrategia</label><input id="strategy" placeholder="Breakout..."></div>
       <div><label>Notas</label><input id="notes" placeholder="Observaciones"></div>
     </div>
-    
     <div style="margin-top:12px">
       <label>Captura de TradingView (Opcional)</label>
       <input type="file" id="chart_image_input" accept="image/*" onchange="handleImageUpload(event)" style="background:transparent;border:none;padding-left:0">
       <img id="image_preview" class="img-preview hidden" src="">
     </div>
-
     <div class="row" style="margin-top:16px;justify-content:flex-end">
       <button class="ghost" onclick="closeForm()">Cancelar</button>
       <button onclick="saveTrade()">Guardar</button>
@@ -315,7 +320,22 @@ HTML = r"""
   </div>
 </div>
 
-<!-- Modal para ver Imagen en Grande -->
+<!-- Modal Configuración -->
+<div class="modal" id="configModal">
+  <div class="card" style="max-width:400px">
+    <div class="row" style="justify-content:space-between"><strong>⚙️ Configuración</strong>
+      <button class="ghost" onclick="closeConfig()">✕</button></div>
+    <p class="mut" style="margin-top:12px">Configurá tu capital inicial para que las métricas y la curva se ajusten a tu cuenta real.</p>
+    <label>Capital Inicial (USD)</label>
+    <input type="text" id="initialCapitalInput" placeholder="Ej: 10000">
+    <div class="row" style="margin-top:16px;justify-content:flex-end">
+      <button class="ghost" onclick="closeConfig()">Cancelar</button>
+      <button onclick="saveConfig()">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Imagen -->
 <div class="modal" id="imageModal" onclick="closeImage()">
   <div style="text-align:center">
     <img id="fullImage" class="modal-img" src="">
@@ -333,6 +353,13 @@ async function api(path, opts = {}) {
   const res = await fetch(path, opts);
   if (!res.ok) { const e = await res.json().catch(() => ({detail: 'Error'})); throw new Error(e.detail || 'Error'); }
   return res.json();
+}
+
+// LA SOLUCIÓN AL BUG DE LAS COMAS
+function parseNum(val) {
+  if (val === null || val === undefined || val === '') return null;
+  // Reemplaza coma por punto
+  return parseFloat(String(val).replace(',', '.'));
 }
 
 function switchAuth() {
@@ -355,7 +382,7 @@ async function doAuth() {
 function logout() {
   localStorage.removeItem('token'); state.token = null; state.user = null; state.trades = [];
   $('appView').classList.add('hidden'); $('authView').classList.remove('hidden');
-  $('userLabel').textContent = ''; $('shareBtn').classList.add('hidden'); $('logoutBtn').classList.add('hidden');
+  $('userLabel').textContent = ''; $('shareBtn').classList.add('hidden'); $('logoutBtn').classList.add('hidden'); $('configBtn').classList.add('hidden');
 }
 
 async function boot() {
@@ -364,6 +391,7 @@ async function boot() {
     try {
       const data = await api('/api/public/' + location.pathname.split('/share/')[1]);
       state.trades = data.trades;
+      state.user = { initial_capital: data.initial_capital };
       $('userLabel').textContent = 'Vista pública de @' + data.username;
       $('publicBanner').classList.remove('hidden');
       $('publicBanner').textContent = 'Bitácora compartida en modo solo lectura.';
@@ -377,7 +405,7 @@ async function boot() {
     state.user = await api('/api/me'); state.trades = await api('/api/trades');
     $('authView').classList.add('hidden'); $('appView').classList.remove('hidden');
     $('userLabel').textContent = '@' + state.user.username;
-    $('logoutBtn').classList.remove('hidden'); $('shareBtn').classList.remove('hidden');
+    $('logoutBtn').classList.remove('hidden'); $('shareBtn').classList.remove('hidden'); $('configBtn').classList.remove('hidden');
     updateShareBtn(); renderAll();
   } catch (e) { logout(); }
 }
@@ -396,7 +424,22 @@ async function toggleShare() {
   navigator.clipboard?.writeText(url); alert('¡Bitácora pública! Enlace copiado:\n' + url);
 }
 
+// CONFIGURACIÓN DE CAPITAL
+function openConfig() {
+  $('initialCapitalInput').value = state.user?.initial_capital || 10000;
+  $('configModal').classList.add('open');
+}
+function closeConfig() { $('configModal').classList.remove('open'); }
+
+async function saveConfig() {
+  const cap = parseNum($('initialCapitalInput').value) || 10000;
+  await api('/api/settings', {method: 'PUT', body: JSON.stringify({amount: cap})});
+  state.user.initial_capital = cap;
+  closeConfig(); renderAll();
+}
+
 function computeMetrics(trades) {
+  const initialCap = state.user?.initial_capital || 10000;
   const closed = trades.filter(t => t.exit_price != null && t.exit_date && t.entry_price != null && t.quantity != null);
   const rows = closed.map(t => {
     const dir = t.side === 'long' ? 1 : -1;
@@ -422,8 +465,18 @@ function computeMetrics(trades) {
   const winRateShort = shorts.length ? (shorts.filter(r => r.pnl > 0).length / shorts.length) * 100 : 0;
   const avgDuration = rows.length ? rows.reduce((s, r) => s + r.durationDays, 0) / rows.length : 0;
 
-  let equity = 0, peak = 0, maxDD = 0; const curve = [{date: 'Inicio', value: 0}];
-  rows.forEach(r => { equity += r.pnl; peak = Math.max(peak, equity); maxDD = Math.max(maxDD, peak - equity); curve.push({date: r.exit_date, value: equity}); });
+  // CURVA BASADA EN CAPITAL INICIAL
+  let currentCapital = initialCap, peak = initialCap, maxDD = 0;
+  const curve = [{date: 'Inicio', value: initialCap}];
+  rows.forEach(r => { 
+    currentCapital += r.pnl; 
+    peak = Math.max(peak, currentCapital); 
+    maxDD = Math.max(maxDD, peak - currentCapital); 
+    curve.push({date: r.exit_date, value: currentCapital}); 
+  });
+  
+  const maxDDpct = peak > 0 ? (maxDD / peak) * 100 : 0;
+  const roi = ((currentCapital - initialCap) / initialCap) * 100;
   const rs = rows.filter(r => r.r != null).map(r => r.r);
 
   return {
@@ -431,7 +484,7 @@ function computeMetrics(trades) {
     profitFactor: grossLoss ? grossProfit / grossLoss : (grossProfit ? Infinity : 0),
     netPnl, expectancy: rows.length ? netPnl / rows.length : 0,
     avgWin: wins.length ? grossProfit / wins.length : 0, avgLoss: losses.length ? -grossLoss / losses.length : 0,
-    maxDD, avgR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null, curve, rows, maxWinStreak, maxLossStreak, winRateLong, winRateShort, avgDuration
+    maxDD, maxDDpct, roi, avgR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null, curve, rows, maxWinStreak, maxLossStreak, winRateLong, winRateShort, avgDuration
   };
 }
 
@@ -441,12 +494,19 @@ function money(n) { return (n >= 0 ? '+' : '') + fmt(n); }
 
 function renderMetrics(m) {
   const cards = [
-    ['Operaciones', m.count, ''], ['Win Rate', pct(m.winRate), ''], ['Profit Factor', m.profitFactor === Infinity ? '∞' : fmt(m.profitFactor), ''],
-    ['PnL Neto', money(m.netPnl), m.netPnl >= 0 ? 'pos' : 'neg'], ['Expectancy', money(m.expectancy), m.expectancy >= 0 ? 'pos' : 'neg'],
-    ['Avg R', m.avgR == null ? '—' : fmt(m.avgR), m.avgR >= 0 ? 'pos' : 'neg'], ['Max Drawdown', fmt(m.maxDD), 'neg'],
+    ['Operaciones', m.count, ''],
+    ['Win Rate', pct(m.winRate), ''],
+    ['Profit Factor', m.profitFactor === Infinity ? '∞' : fmt(m.profitFactor), ''],
+    ['PnL Neto', money(m.netPnl), m.netPnl >= 0 ? 'pos' : 'neg'],
+    ['ROI', pct(m.roi), m.roi >= 0 ? 'pos' : 'neg'],
+    ['Expectancy', money(m.expectancy), m.expectancy >= 0 ? 'pos' : 'neg'],
+    ['Avg R', m.avgR == null ? '—' : fmt(m.avgR), m.avgR >= 0 ? 'pos' : 'neg'],
+    ['Max Drawdown', fmt(m.maxDD) + ' (' + pct(m.maxDDpct) + ')', 'neg'],
     ['Avg Win / Loss', money(m.avgWin) + ' / ' + money(m.avgLoss), ''],
-    ['Racha Max Wins', m.maxWinStreak, 'pos'], ['Racha Max Losses', m.maxLossStreak, 'neg'],
-    ['Win Rate Long', pct(m.winRateLong), ''], ['Win Rate Short', pct(m.winRateShort), ''],
+    ['Racha Max Wins', m.maxWinStreak, 'pos'],
+    ['Racha Max Losses', m.maxLossStreak, 'neg'],
+    ['Win Rate Long', pct(m.winRateLong), ''],
+    ['Win Rate Short', pct(m.winRateShort), ''],
     ['Duración Media', fmt(m.avgDuration, 1) + ' días', '']
   ];
   $('metricsGrid').innerHTML = cards.map(c => `<div class="metric"><div class="l">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
@@ -495,7 +555,6 @@ function renderTable(rows) {
     const r = closed && risk ? pnl / risk : null;
     const cls = pnl == null ? '' : (pnl >= 0 ? 'pos' : 'neg');
     
-    // Botón de imagen
     const imgBtn = t.has_image ? `<button class="ghost" onclick="viewImage(${t.id})">📸 Ver</button>` : '—';
 
     html += `<tr>
@@ -503,8 +562,8 @@ function renderTable(rows) {
       <td>${t.side === 'long' ? '🟢 L' : '🔴 S'}</td>
       <td>${t.entry_date || '—'}</td>
       <td>${t.exit_date || 'abierta'}</td>
-      <td>${fmt(t.entry_price)}</td>
-      <td>${t.exit_price == null ? '—' : fmt(t.exit_price)}</td>
+      <td>${fmt(t.entry_price, 4)}</td>
+      <td>${t.exit_price == null ? '—' : fmt(t.exit_price, 4)}</td>
       <td>${fmt(t.quantity)}</td>
       <td class="${cls}">${pnl == null ? '—' : money(pnl)}</td>
       <td class="${cls}">${r == null ? '—' : fmt(r) + 'R'}</td>
@@ -522,12 +581,9 @@ function renderAll() {
   renderMetrics(m); renderChart(m.curve); renderTable(m.rows);
 }
 
-// ---------- Imágenes ----------
 function handleImageUpload(event) {
   const file = event.target.files[0];
   if (!file) return;
-
-  // Comprimir imagen usando Canvas
   const reader = new FileReader();
   reader.onload = (e) => {
     const img = new Image();
@@ -537,12 +593,9 @@ function handleImageUpload(event) {
       const MAX_SIZE = 1000;
       if (width > height && width > MAX_SIZE) { height *= MAX_SIZE / width; width = MAX_SIZE; }
       else if (height > MAX_SIZE) { width *= MAX_SIZE / height; height = MAX_SIZE; }
-      
       canvas.width = width; canvas.height = height;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, 0, 0, width, height);
-      
-      // Calidad 0.7 (buen balance entre peso y calidad)
       state.currentImageBase64 = canvas.toDataURL('image/jpeg', 0.7);
       $('image_preview').src = state.currentImageBase64;
       $('image_preview').classList.remove('hidden');
@@ -562,22 +615,20 @@ async function viewImage(id) {
 
 function closeImage() { $('imageModal').classList.remove('open'); }
 
-// ---------- Formulario ----------
 function openForm(id) {
   const t = id ? state.trades.find(x => x.id === id) : null;
   $('formTitle').textContent = t ? 'Editar operación' : 'Nueva operación';
   $('tradeId').value = t ? t.id : '';
   ['symbol','side','entry_date','exit_date','entry_price','exit_price','quantity','stop_loss','take_profit','fees','strategy','notes'].forEach(k => {
+    // Si es un número, lo mostramos con coma si el usuario lo prefiere, pero lo guardamos como string
     $(k).value = t && t[k] != null ? t[k] : (k === 'fees' ? 0 : '');
   });
   if (!t) $('side').value = 'long';
   
-  // Resetear imagen
   state.currentImageBase64 = null;
   $('chart_image_input').value = '';
   $('image_preview').classList.add('hidden');
   $('image_preview').src = '';
-  
   $('modal').classList.add('open');
 }
 function closeForm() { $('modal').classList.remove('open'); }
@@ -587,11 +638,12 @@ async function saveTrade() {
   const body = {
     symbol: $('symbol').value.trim().toUpperCase(), side: $('side').value,
     entry_date: $('entry_date').value || null, exit_date: $('exit_date').value || null,
-    entry_price: parseFloat($('entry_price').value) || null, exit_price: parseFloat($('exit_price').value) || null,
-    quantity: parseFloat($('quantity').value) || null, stop_loss: parseFloat($('stop_loss').value) || null,
-    take_profit: parseFloat($('take_profit').value) || null, fees: parseFloat($('fees').value) || 0,
+    // AQUI APLICAMOS LA SOLUCIÓN PARSE NUM
+    entry_price: parseNum($('entry_price').value), exit_price: parseNum($('exit_price').value),
+    quantity: parseNum($('quantity').value), stop_loss: parseNum($('stop_loss').value),
+    take_profit: parseNum($('take_profit').value), fees: parseNum($('fees').value) || 0,
     strategy: $('strategy').value.trim() || null, notes: $('notes').value.trim() || null,
-    chart_image: state.currentImageBase64 // Enviamos la imagen comprimida
+    chart_image: state.currentImageBase64
   };
   if (!body.symbol) { alert('El símbolo es obligatorio'); return; }
   try {
