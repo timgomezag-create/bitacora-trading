@@ -18,7 +18,7 @@ DB = "journal.db"
 @contextmanager
 def get_db():
     if USE_TURSO:
-        client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_TOKEN)
+        client = libsql_client.create_client_sync(sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
         try:
             yield client
         finally:
