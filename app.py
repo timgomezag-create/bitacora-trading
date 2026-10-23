@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import libsql_client
+import httpx  # <--- Usaremos httpx en lugar de libsql_client
 
 app = FastAPI(title="Bitácora de Trading Pro")
 
@@ -18,16 +18,43 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 DB_LOCAL = "journal.db"
 
+# --- Cliente HTTP directo para Turso (reemplaza a libsql_client) ---
+def turso_http_execute(sql: str, params: list = None, fetch: bool = False):
+    """Ejecuta SQL directamente contra la API HTTP de Turso."""
+    url = TURSO_URL.replace("libsql://", "https://") if TURSO_URL.startswith("libsql://") else TURSO_URL
+    payload = {
+        "requests": [
+            {
+                "type": "execute",
+                "stmt": {
+                    "sql": sql,
+                    "args": [{"type": "text", "value": str(p)} for p in (params or [])]
+                }
+            },
+            {"type": "close"}
+        ]
+    }
+    headers = {"Authorization": f"Bearer {TURSO_TOKEN}"}
+    
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(f"{url}/v2/pipeline", json=payload, headers=headers)
+        resp.raise_for_status()  # Lanza excepción si hay error HTTP (ej. 502)
+        data = resp.json()
+        result = data["results"][0]
+        if result.get("type") == "error":
+            raise RuntimeError(f"Turso error: {result['error']}")
+        res = result["response"]["result"]
+        
+        if fetch:
+            cols = [c["name"] for c in res["cols"]]
+            return [{cols[i]: cell.get("value") for i, cell in enumerate(row)} for row in res["rows"]]
+        return res
+
 @contextmanager
 def get_db():
     if USE_TURSO:
-        # Normalizar la URL de Turso para libsql_client
-        url = TURSO_URL.replace("libsql://", "https://") if TURSO_URL.startswith("libsql://") else TURSO_URL
-        client = libsql_client.create_client_sync(url=url, auth_token=TURSO_TOKEN)
-        try:
-            yield client
-        finally:
-            client.close()
+        # Ya no usamos libsql_client, yield no es necesario para Turso
+        yield None
     else:
         conn = sqlite3.connect(DB_LOCAL)
         conn.row_factory = sqlite3.Row
@@ -38,44 +65,44 @@ def get_db():
             conn.close()
 
 def db_execute(query, params=(), fetch=False):
-    with get_db() as c:
-        if USE_TURSO:
-            res = c.execute(query, list(params))
-            if fetch:
-                return [dict(row) for row in res.rows]
-            return res
-        else:
+    if USE_TURSO:
+        return turso_http_execute(query, params, fetch)
+    else:
+        with get_db() as c:
             cur = c.execute(query, params)
             if fetch:
                 return [dict(row) for row in cur.fetchall()]
             return cur
 
 def init_db():
-    with get_db() as c:
-        if USE_TURSO:
-            statements = [
-                "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)",
-                "CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)",
-                """CREATE TABLE IF NOT EXISTS trades(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                    user_id INTEGER NOT NULL, 
-                    symbol TEXT NOT NULL, 
-                    side TEXT NOT NULL,
-                    session TEXT,
-                    setup TEXT,
-                    result TEXT,
-                    pips REAL,
-                    lot_size REAL,
-                    pip_value REAL DEFAULT 10,
-                    risk_pips REAL,
-                    notes TEXT,
-                    chart_image TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )"""
-            ]
-            for stmt in statements:
-                c.execute(stmt)
-        else:
+    if USE_TURSO:
+        statements = [
+            "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000)",
+            "CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL)",
+            """CREATE TABLE IF NOT EXISTS trades(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                user_id INTEGER NOT NULL, 
+                symbol TEXT NOT NULL, 
+                side TEXT NOT NULL,
+                session TEXT,
+                setup TEXT,
+                result TEXT,
+                pips REAL,
+                lot_size REAL,
+                pip_value REAL DEFAULT 10,
+                risk_pips REAL,
+                notes TEXT,
+                chart_image TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        ]
+        for stmt in statements:
+            try:
+                turso_http_execute(stmt)
+            except Exception as e:
+                print(f"Error creando tabla: {e}")
+    else:
+        with get_db() as c:
             c.executescript("""
             CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, share_token TEXT UNIQUE, is_public INTEGER DEFAULT 0, initial_capital REAL DEFAULT 10000);
             CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL);
@@ -97,7 +124,7 @@ def init_db():
             );
             """)
     
-    # Migraciones seguras para añadir columnas nuevas a tablas existentes
+    # Migraciones seguras (solo para SQLite local o si Turso ya tiene la tabla)
     nuevas_columnas = [
         ("session", "TEXT"),
         ("setup", "TEXT"),
@@ -123,6 +150,7 @@ def ensure_db():
     try:
         init_db()
         _db_initialized = True
+        print("✅ Base de datos inicializada correctamente.")
     except Exception as e:
         print(f"⚠️ Error al inicializar la DB (se reintentará luego): {e}")
 
@@ -182,7 +210,7 @@ class CapitalIn(BaseModel):
 # ---------- Rutas de Autenticación ----------
 @app.post("/api/register")
 def register(data: AuthIn):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     if len(data.username) < 3 or len(data.password) < 6:
         raise HTTPException(400, "Usuario mínimo 3 y contraseña mínimo 6")
     try:
@@ -199,7 +227,7 @@ def register(data: AuthIn):
 
 @app.post("/api/login")
 def login(data: AuthIn):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     rows = db_execute("SELECT * FROM users WHERE username=?", (data.username,), fetch=True)
     if not rows or not check_pw(data.password, rows[0]["password_hash"]):
         raise HTTPException(401, "Credenciales incorrectas")
@@ -209,13 +237,13 @@ def login(data: AuthIn):
 
 @app.get("/api/me")
 def me(authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     return db_execute("SELECT id, username, share_token, is_public, initial_capital FROM users WHERE id=?", (uid,), fetch=True)[0]
 
 @app.put("/api/settings")
 def update_settings(data: CapitalIn, authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     db_execute("UPDATE users SET initial_capital=? WHERE id=?", (data.amount, uid))
     return {"ok": True}
@@ -223,7 +251,7 @@ def update_settings(data: CapitalIn, authorization: str = Header(None)):
 # ---------- Rutas de Operaciones ----------
 @app.get("/api/trades")
 def list_trades(authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     return db_execute("""
         SELECT id, user_id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes,
@@ -233,7 +261,7 @@ def list_trades(authorization: str = Header(None)):
 
 @app.get("/api/trades/{trade_id}/image")
 def get_trade_image(trade_id: int, authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     rows = db_execute("SELECT chart_image FROM trades WHERE id=? AND user_id=?", (trade_id, uid), fetch=True)
     if not rows or not rows[0]["chart_image"]:
@@ -242,7 +270,7 @@ def get_trade_image(trade_id: int, authorization: str = Header(None)):
 
 @app.post("/api/trades")
 def create_trade(t: TradeIn, authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     db_execute("""
         INSERT INTO trades(user_id, symbol, side, session, setup, result, pips, lot_size, pip_value, risk_pips, notes, chart_image)
@@ -252,7 +280,7 @@ def create_trade(t: TradeIn, authorization: str = Header(None)):
 
 @app.put("/api/trades/{trade_id}")
 def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     db_execute("""
         UPDATE trades SET symbol=?, side=?, session=?, setup=?, result=?, pips=?, lot_size=?, pip_value=?, risk_pips=?, notes=?, chart_image=COALESCE(?, chart_image)
@@ -262,7 +290,7 @@ def update_trade(trade_id: int, t: TradeIn, authorization: str = Header(None)):
 
 @app.delete("/api/trades/{trade_id}")
 def delete_trade(trade_id: int, authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     db_execute("DELETE FROM trades WHERE id=? AND user_id=?", (trade_id, uid))
     return {"ok": True}
@@ -270,7 +298,7 @@ def delete_trade(trade_id: int, authorization: str = Header(None)):
 # ---------- Rutas para Compartir ----------
 @app.post("/api/share")
 def toggle_share(data: ShareIn, authorization: str = Header(None)):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     uid = current_user(authorization)
     db_execute("UPDATE users SET is_public=? WHERE id=?", (1 if data.enabled else 0, uid))
     rows = db_execute("SELECT share_token FROM users WHERE id=?", (uid,), fetch=True)
@@ -278,7 +306,7 @@ def toggle_share(data: ShareIn, authorization: str = Header(None)):
 
 @app.get("/api/public/{share_token}")
 def public_view(share_token: str):
-    ensure_db() # <-- Asegurar DB
+    ensure_db()
     users = db_execute("SELECT id, username, is_public, initial_capital FROM users WHERE share_token=?", (share_token,), fetch=True)
     if not users or not users[0]["is_public"]:
         raise HTTPException(404, "Bitácora no disponible")
