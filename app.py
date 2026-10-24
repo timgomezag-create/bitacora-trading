@@ -2,13 +2,14 @@ import os
 import sqlite3
 import hashlib
 import secrets
+import time  # <--- NUEVO: Para las pausas entre reintentos
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import httpx  # <--- Usaremos httpx en lugar de libsql_client
+import httpx
 
 app = FastAPI(title="Bitácora de Trading Pro")
 
@@ -18,9 +19,8 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 DB_LOCAL = "journal.db"
 
-# --- Cliente HTTP directo para Turso (reemplaza a libsql_client) ---
+# --- Cliente HTTP directo para Turso con REINTENTOS ---
 def turso_http_execute(sql: str, params: list = None, fetch: bool = False):
-    """Ejecuta SQL directamente contra la API HTTP de Turso."""
     url = TURSO_URL.replace("libsql://", "https://") if TURSO_URL.startswith("libsql://") else TURSO_URL
     payload = {
         "requests": [
@@ -36,24 +36,43 @@ def turso_http_execute(sql: str, params: list = None, fetch: bool = False):
     }
     headers = {"Authorization": f"Bearer {TURSO_TOKEN}"}
     
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(f"{url}/v2/pipeline", json=payload, headers=headers)
-        resp.raise_for_status()  # Lanza excepción si hay error HTTP (ej. 502)
-        data = resp.json()
-        result = data["results"][0]
-        if result.get("type") == "error":
-            raise RuntimeError(f"Turso error: {result['error']}")
-        res = result["response"]["result"]
-        
-        if fetch:
-            cols = [c["name"] for c in res["cols"]]
-            return [{cols[i]: cell.get("value") for i, cell in enumerate(row)} for row in res["rows"]]
-        return res
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{url}/v2/pipeline", json=payload, headers=headers)
+                
+                # Si el error es 502, esperamos un poco y reintentamos
+                if resp.status_code == 502 and attempt < max_retries - 1:
+                    print(f"⚠️ Error 502 detectado (intento {attempt+1}/{max_retries}). Reintentando en 2s...")
+                    time.sleep(2)
+                    continue
+                
+                resp.raise_for_status()
+                data = resp.json()
+                result = data["results"][0]
+                if result.get("type") == "error":
+                    raise RuntimeError(f"Turso error: {result['error']}")
+                res = result["response"]["result"]
+                
+                if fetch:
+                    cols = [c["name"] for c in res["cols"]]
+                    return [{cols[i]: cell.get("value") for i, cell in enumerate(row)} for row in res["rows"]]
+                return res
+                
+        except httpx.HTTPStatusError as e:
+            # Si es un error 502 y aún nos quedan intentos, reintentamos
+            if e.response.status_code == 502 and attempt < max_retries - 1:
+                print(f"⚠️ Excepción 502 capturada (intento {attempt+1}/{max_retries}). Reintentando en 2s...")
+                time.sleep(2)
+                continue
+            raise e  # Si es otro error (400, 404, etc.) o se acabaron los intentos, lo lanzamos
+            
+    raise RuntimeError("Se agotaron los reintentos para conectar con Turso por error 502.")
 
 @contextmanager
 def get_db():
     if USE_TURSO:
-        # Ya no usamos libsql_client, yield no es necesario para Turso
         yield None
     else:
         conn = sqlite3.connect(DB_LOCAL)
@@ -124,23 +143,16 @@ def init_db():
             );
             """)
     
-    # Migraciones seguras (solo para SQLite local o si Turso ya tiene la tabla)
     nuevas_columnas = [
-        ("session", "TEXT"),
-        ("setup", "TEXT"),
-        ("result", "TEXT"),
-        ("pips", "REAL"),
-        ("lot_size", "REAL"),
-        ("pip_value", "REAL DEFAULT 10"),
-        ("risk_pips", "REAL")
+        ("session", "TEXT"), ("setup", "TEXT"), ("result", "TEXT"),
+        ("pips", "REAL"), ("lot_size", "REAL"), ("pip_value", "REAL DEFAULT 10"), ("risk_pips", "REAL")
     ]
     for col, tipo in nuevas_columnas:
         try:
             db_execute(f"ALTER TABLE trades ADD COLUMN {col} {tipo}")
         except Exception:
-            pass  # La columna ya existe
+            pass
 
-# --- INICIALIZACIÓN SEGURA ---
 _db_initialized = False
 
 def ensure_db():
@@ -154,7 +166,6 @@ def ensure_db():
     except Exception as e:
         print(f"⚠️ Error al inicializar la DB (se reintentará luego): {e}")
 
-# Intentar inicializar al arrancar, pero SIN bloquear si falla
 try:
     ensure_db()
 except Exception:
@@ -388,7 +399,6 @@ HTML = r"""
   
   <div class="grid" id="metricsGrid"></div>
   
-  <!-- Dashboard de Edge -->
   <div class="card">
     <strong>📊 Dashboard de Edge (Mejor rendimiento)</strong>
     <div class="grid" style="margin-top:12px" id="edgeGrid">
@@ -423,7 +433,6 @@ HTML = r"""
   </div>
 </div>
 
-<!-- Modal de Formulario -->
 <div class="modal" id="modal">
   <div class="card">
     <div class="row" style="justify-content:space-between"><strong id="formTitle">Nueva operación</strong>
@@ -479,7 +488,6 @@ HTML = r"""
   </div>
 </div>
 
-<!-- Modal de Configuración -->
 <div class="modal" id="configModal">
   <div class="card" style="max-width:400px">
     <div class="row" style="justify-content:space-between"><strong>⚙️ Configuración</strong>
@@ -627,7 +635,6 @@ function computeMetrics(trades) {
   const roi = ((currentCapital - initialCap) / initialCap) * 100;
   const rs = rows.filter(r => r.r != null).map(r => r.r);
 
-  // --- Cálculos de Edge ---
   const groupBy = (arr, key) => arr.reduce((acc, obj) => {
       const k = obj[key] || 'N/A';
       if (!acc[k]) acc[k] = {pnl: 0, count: 0, wins: 0};
@@ -797,13 +804,11 @@ function openForm(id) {
   $('formTitle').textContent = t ? 'Editar operación' : 'Nueva operación';
   $('tradeId').value = t ? t.id : '';
   
-  // Llenar campos
   const fields = ['symbol','side','session','setup','result','pips','lot_size','pip_value','risk_pips','notes'];
   fields.forEach(k => {
     if (t && t[k] != null) {
       $(k).value = t[k];
     } else {
-      // Valores por defecto
       if (k === 'pip_value') $(k).value = 10;
       else if (k === 'side') $(k).value = 'long';
       else if (k === 'session') $(k).value = 'Londres';
@@ -813,9 +818,8 @@ function openForm(id) {
     }
   });
   
-  // Manejar fecha
   if (t && t.created_at) {
-      $('created_at').value = t.created_at.slice(0, 16); // Formato datetime-local
+      $('created_at').value = t.created_at.slice(0, 16);
   } else {
       $('created_at').value = new Date().toISOString().slice(0, 16);
   }
